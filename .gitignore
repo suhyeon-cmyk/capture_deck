@@ -1,0 +1,36 @@
+# ---- PyInstaller 빌드 결과물
+build/
+dist/
+# .spec 파일은 build.bat 실행 시 매번 다시 생성됨
+*.spec
+
+# ---- Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ---- 실행 시 생성되는 사용자 설정 / 임시 파일
+settings.ini
+*.tmp.mkv
+*.tmp.wav
+
+# ---- 녹화/편집 결과물 (실수로 커밋 방지)
+*.mp4
+*.mkv
+*.wav
+
+# ---- IDE / 에디터
+.vscode/
+.idea/
+*.swp
+
+# ---- OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# ---- Claude Code 로컬 설정
+.claude/settings.local.json
