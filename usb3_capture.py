@@ -58,7 +58,8 @@ PREVIEW_W, PREVIEW_H = 960, 540
 DEFAULTS = {
     "video": "", "audio": "", "resolution": "1920x1080", "fps": "60",
     "out_dir": str(Path.home() / "Videos" / "Captures"), "monitor": False,
-    "sched_mode": "range", "sched_start": "09:00", "sched_end": "10:00", "sched_minutes": "60",
+    "sched_mode": "range", "sched_start": "09:00:00", "sched_end": "10:00:00", "sched_minutes": "60",
+    "sched_duration": "",  # 지금부터 녹화할 시간 "H:M:S" (비어 있으면 sched_minutes 사용 - 예전 설정 호환)
     "trim_after": True, "geometry": "", "tab": "0",
 }
 
@@ -162,12 +163,23 @@ def pick_by_keyword(names, saved, keywords=KEYWORDS):
     return names[0] if names else ""
 
 
-def schedule_window(start_hm, end_hm, now):
-    """'HH:MM' 두 개 → 지금 진행 중이거나 다음에 올 (시작, 종료) datetime. 자정 넘김 지원"""
-    sh, sm = map(int, start_hm.split(":"))
-    eh, em = map(int, end_hm.split(":"))
-    s = now.replace(hour=sh, minute=sm, second=0, microsecond=0)
-    e = now.replace(hour=eh, minute=em, second=0, microsecond=0)
+def parse_clock(text):
+    """'HH:MM' 또는 'HH:MM:SS' → 'HH:MM:SS' (형식이 틀리면 ValueError)"""
+    text = text.strip()
+    for fmt in ("%H:%M:%S", "%H:%M"):
+        try:
+            return datetime.strptime(text, fmt).strftime("%H:%M:%S")
+        except ValueError:
+            pass
+    raise ValueError(text)
+
+
+def schedule_window(start_hms, end_hms, now):
+    """'HH:MM:SS' 두 개 → 지금 진행 중이거나 다음에 올 (시작, 종료) datetime. 자정 넘김 지원"""
+    sh, sm, ss = map(int, parse_clock(start_hms).split(":"))
+    eh, em, es = map(int, parse_clock(end_hms).split(":"))
+    s = now.replace(hour=sh, minute=sm, second=ss, microsecond=0)
+    e = now.replace(hour=eh, minute=em, second=es, microsecond=0)
     if e <= s:
         e += timedelta(days=1)
     day = timedelta(days=1)
@@ -955,32 +967,39 @@ class App:
         r1.grid(row=0, column=1, sticky="w")
         self.rb_range = ttk.Radiobutton(r1, text="시간 지정", value="range", variable=self.var_s_mode)
         self.rb_range.pack(side="left")
-        self.var_s_start = tk.StringVar(value=self.cfg["sched_start"])
-        self.var_s_end = tk.StringVar(value=self.cfg["sched_end"])
-        self.ent_s_start = ttk.Entry(r1, textvariable=self.var_s_start, width=6, justify="center")
+        self.var_s_start = tk.StringVar(value=self._clock_or(self.cfg["sched_start"], "09:00:00"))
+        self.var_s_end = tk.StringVar(value=self._clock_or(self.cfg["sched_end"], "10:00:00"))
+        self.ent_s_start = ttk.Entry(r1, textvariable=self.var_s_start, width=9, justify="center")
         self.ent_s_start.pack(side="left", padx=(6, 2))
         ttk.Label(r1, text="부터").pack(side="left")
-        self.ent_s_end = ttk.Entry(r1, textvariable=self.var_s_end, width=6, justify="center")
+        self.ent_s_end = ttk.Entry(r1, textvariable=self.var_s_end, width=9, justify="center")
         self.ent_s_end.pack(side="left", padx=(6, 2))
-        ttk.Label(r1, text="까지  (24시간, 예: 14:30)").pack(side="left")
-        # 방식 2: 지금부터 몇 분간
+        ttk.Label(r1, text="까지  (24시간, 예: 14:30:00)").pack(side="left")
+        # 방식 2: 지금부터 몇 시간 몇 분 몇 초간
         r2 = ttk.Frame(s)
         r2.grid(row=1, column=1, sticky="w")
         self.rb_dur = ttk.Radiobutton(r2, text="지금부터", value="duration", variable=self.var_s_mode)
         self.rb_dur.pack(side="left")
-        self.var_s_min = tk.StringVar(value=self.cfg["sched_minutes"])
-        self.ent_s_min = ttk.Entry(r2, textvariable=self.var_s_min, width=6, justify="center")
-        self.ent_s_min.pack(side="left", padx=(6, 2))
-        ttk.Label(r2, text="분간").pack(side="left")
+        dh, dm, ds = self._initial_duration()
+        self.var_s_h, self.var_s_m, self.var_s_s = (tk.StringVar(value=str(v)) for v in (dh, dm, ds))
+        self.dur_entries = []
+        for i, (var, unit) in enumerate(((self.var_s_h, "시간"), (self.var_s_m, "분"), (self.var_s_s, "초간"))):
+            ent = ttk.Entry(r2, textvariable=var, width=4, justify="center")
+            ent.pack(side="left", padx=(6 if i == 0 else 4, 2))
+            ttk.Label(r2, text=unit).pack(side="left")
+            self.dur_entries.append(ent)
+        # 지금부터 녹화하면 몇 시 몇 분 몇 초에 끝나는지 실시간 표시
+        self.lbl_s_until = ttk.Label(r2, text="", foreground="#1a5fb4")
+        self.lbl_s_until.pack(side="left", padx=(10, 0))
         self.btn_sched = ttk.Button(s, text="예약", command=self.toggle_schedule)
         self.btn_sched.grid(row=0, column=2, padx=12, sticky="ew")
         self.btn_sched_end = ttk.Button(s, text="종료 시간 변경", command=self.change_sched_end, state="disabled")
         self.btn_sched_end.grid(row=1, column=2, padx=12, sticky="ew")
-        for e in (self.ent_s_end, self.ent_s_min):  # 예약 중 Enter로도 종료 시간 변경
+        for e in (self.ent_s_end, *self.dur_entries):  # 예약 중 Enter로도 종료 시간 변경
             e.bind("<Return>", lambda ev: self.change_sched_end() if self.sched else None)
         self.lbl_sched = ttk.Label(s, text="예약 없음")
         self.lbl_sched.grid(row=0, column=3, rowspan=2, sticky="w")
-        self.sched_inputs = (self.rb_range, self.rb_dur, self.ent_s_start, self.ent_s_end, self.ent_s_min)
+        self.sched_inputs = (self.rb_range, self.rb_dur, self.ent_s_start, self.ent_s_end, *self.dur_entries)
 
         b = ttk.Frame(r)
         b.pack(fill="x", padx=8, pady=(0, 8))
@@ -1097,47 +1116,97 @@ class App:
                 self.lbl_sched.config(text="예약 녹화를 직접 중지했어요")
 
     # ---- 예약
+    @staticmethod
+    def _clock_or(text, default):
+        try:
+            return parse_clock(text)
+        except ValueError:
+            return default
+
+    def _initial_duration(self):
+        """저장된 '지금부터' 시간 → (시, 분, 초). 예전 설정(분 단위)도 읽음"""
+        try:
+            h, m, s = (int(x) for x in self.cfg.get("sched_duration", "").split(":"))
+            return h, m, s
+        except ValueError:
+            pass
+        try:
+            total = max(0, int(self.cfg.get("sched_minutes", "60"))) * 60
+        except ValueError:
+            total = 3600
+        return total // 3600, total % 3600 // 60, total % 60
+
+    def _get_duration(self):
+        """'지금부터' 입력칸 → 녹화할 초 (빈칸은 0, 잘못된 값이면 None)"""
+        try:
+            h, m, s = (int(v.get().strip() or 0) for v in (self.var_s_h, self.var_s_m, self.var_s_s))
+        except ValueError:
+            return None
+        if min(h, m, s) < 0:
+            return None
+        total = h * 3600 + m * 60 + s
+        return total if total > 0 else None
+
+    def _save_duration(self, total):
+        self.cfg["sched_duration"] = f"{total // 3600}:{total % 3600 // 60}:{total % 60}"
+
+    @staticmethod
+    def _fmt_end(e, now):
+        return ("내일 " if e.date() > now.date() else "") + f"{e:%H:%M:%S}"
+
+    def _update_until_label(self):
+        """'지금부터' 시간으로 녹화하면 끝나는 시각을 실시간으로 표시"""
+        text = ""
+        if self.var_s_mode.get() == "duration" or (self.sched and self.sched_mode == "duration"):
+            total = self._get_duration()
+            now = datetime.now()
+            if total is None:
+                text = "→ 시간을 확인해 주세요"
+            else:
+                base = self.sched[0] if (self.sched and self.sched_mode == "duration") else now
+                text = f"→ {self._fmt_end(base + timedelta(seconds=total), now)}에 종료"
+        if self.lbl_s_until.cget("text") != text:
+            self.lbl_s_until.config(text=text)
+
     def toggle_schedule(self):
         if self.sched:
             self.cancel_schedule()
             return
-        if self.recording:
-            messagebox.showinfo("예약", "녹화 중에는 예약할 수 없어요. 녹화를 먼저 멈춰 주세요.")
-            return
         mode = self.var_s_mode.get()
+        now = datetime.now()
         if mode == "duration":
-            try:
-                minutes = int(self.var_s_min.get().strip())
-                if minutes <= 0:
-                    raise ValueError
-            except ValueError:
-                messagebox.showwarning("예약", "녹화할 시간을 1 이상의 분 단위 숫자로 입력해 주세요. (예: 30)")
+            total = self._get_duration()
+            if total is None:
+                messagebox.showwarning("예약", "녹화할 시간을 시간/분/초 숫자로 입력해 주세요. (예: 0시간 30분 15초)")
                 return
-            now = datetime.now()
-            self.sched = (now, now + timedelta(minutes=minutes))
-            self.cfg.update(sched_mode=mode, sched_minutes=str(minutes))
+            self.sched = (now, now + timedelta(seconds=total))
+            self.cfg["sched_mode"] = mode
+            self._save_duration(total)
         else:
-            a, b = self.var_s_start.get().strip(), self.var_s_end.get().strip()
             try:
-                a = datetime.strptime(a, "%H:%M").strftime("%H:%M")
-                b = datetime.strptime(b, "%H:%M").strftime("%H:%M")
+                a = parse_clock(self.var_s_start.get())
+                b = parse_clock(self.var_s_end.get())
             except ValueError:
-                messagebox.showwarning("예약", "시간을 HH:MM 형식으로 입력해 주세요. (예: 09:00, 14:30)")
+                messagebox.showwarning("예약", "시간을 HH:MM:SS 형식으로 입력해 주세요. (예: 09:00:00, 14:30:15)")
                 return
             if a == b:
                 messagebox.showwarning("예약", "시작 시간과 종료 시간이 같아요.")
                 return
             self.var_s_start.set(a)
             self.var_s_end.set(b)
-            self.sched = schedule_window(a, b, datetime.now())
+            self.sched = schedule_window(a, b, now)
             self.cfg.update(sched_mode=mode, sched_start=a, sched_end=b)
         save_config(self.cfg)
         self.sched_mode = mode
+        # 이미 녹화 중이고 예약 구간 안이면, 지금 녹화를 예약 녹화로 이어받아 종료 시간에 멈춤
+        if self.recording and self.sched[0] <= now < self.sched[1]:
+            self.sched_rec = True
         self.btn_sched.config(text="예약 취소")
         for w in self.sched_inputs:
             w.config(state="disabled")
-        # 종료 시간(또는 분)은 예약/녹화 중에도 바꿀 수 있게 열어 둠
-        (self.ent_s_min if mode == "duration" else self.ent_s_end).config(state="normal")
+        # 종료 시간(또는 지금부터 시간)은 예약/녹화 중에도 바꿀 수 있게 열어 둠
+        for w in (self.dur_entries if mode == "duration" else (self.ent_s_end,)):
+            w.config(state="normal")
         self.btn_sched_end.config(state="normal")
         keep_awake(True)
         self._check_schedule()
@@ -1148,29 +1217,26 @@ class App:
         s, e = self.sched
         now = datetime.now()
         if self.sched_mode == "duration":
-            try:
-                minutes = int(self.var_s_min.get().strip())
-                if minutes <= 0:
-                    raise ValueError
-            except ValueError:
-                messagebox.showwarning("종료 시간 변경", "1 이상의 분 단위 숫자로 입력해 주세요. (예: 30)")
+            total = self._get_duration()
+            if total is None:
+                messagebox.showwarning("종료 시간 변경", "녹화할 시간을 시간/분/초 숫자로 입력해 주세요. (예: 0시간 30분 15초)")
                 return
-            new_e = s + timedelta(minutes=minutes)  # 예약 시작 시각부터 N분
-            self.cfg["sched_minutes"] = str(minutes)
+            new_e = s + timedelta(seconds=total)  # 예약 시작 시각부터 N시간 N분 N초
+            self._save_duration(total)
         else:
             try:
-                t = datetime.strptime(self.var_s_end.get().strip(), "%H:%M")
+                t = datetime.strptime(parse_clock(self.var_s_end.get()), "%H:%M:%S")
             except ValueError:
-                messagebox.showwarning("종료 시간 변경", "시간을 HH:MM 형식으로 입력해 주세요. (예: 14:30)")
+                messagebox.showwarning("종료 시간 변경", "시간을 HH:MM:SS 형식으로 입력해 주세요. (예: 14:30:15)")
                 return
-            new_e = s.replace(hour=t.hour, minute=t.minute)
+            new_e = s.replace(hour=t.hour, minute=t.minute, second=t.second, microsecond=0)
             if new_e <= s:  # 시작보다 이른 시각이면 다음 날
                 new_e += timedelta(days=1)
-            self.var_s_end.set(f"{new_e:%H:%M}")
-            self.cfg["sched_end"] = f"{new_e:%H:%M}"
+            self.var_s_end.set(f"{new_e:%H:%M:%S}")
+            self.cfg["sched_end"] = f"{new_e:%H:%M:%S}"
         if new_e <= now:
             messagebox.showwarning("종료 시간 변경",
-                                   f"{new_e:%H:%M}은 이미 지난 시간이에요. 지금 멈추려면 '녹화 중지'를 눌러 주세요.")
+                                   f"{new_e:%H:%M:%S}은 이미 지난 시간이에요. 지금 멈추려면 '녹화 중지'를 눌러 주세요.")
             return
         save_config(self.cfg)
         self.sched = (s, new_e)
@@ -1192,7 +1258,7 @@ class App:
             return
         s, e = self.sched
         now = datetime.now()
-        end = ("내일 " if e.date() > now.date() else "") + f"{e:%H:%M}"
+        end = self._fmt_end(e, now)
         if self.recording and self.sched_rec:
             left = max(0, int((e - now).total_seconds()))
             self.lbl_sched.config(text=f"예약 녹화 중 - {end}에 종료 "
@@ -1200,10 +1266,10 @@ class App:
             if now >= e:
                 self.stop_recording()
                 self.cancel_schedule()
-                self.lbl_sched.config(text=f"예약 녹화 완료 ({s:%m/%d %H:%M} ~ {e:%H:%M})")
+                self.lbl_sched.config(text=f"예약 녹화 완료 ({s:%m/%d %H:%M:%S} ~ {e:%H:%M:%S})")
             return
         if self.recording:  # 수동 녹화 중이면 끝날 때까지 기다림
-            self.lbl_sched.config(text=f"예약: {s:%m/%d %H:%M} ~ {end}  (수동 녹화 중)")
+            self.lbl_sched.config(text=f"예약: {s:%m/%d %H:%M:%S} ~ {end}  (수동 녹화 중)")
             return
         if now >= e:  # 구간을 놓침 (예: 영상 신호 없음) → 예약 해제
             self.cancel_schedule()
@@ -1216,8 +1282,8 @@ class App:
                 self.lbl_sched.config(text=f"예약 시작 대기 - 영상 신호를 기다리는 중 ({end}까지)")
             return
         wait = int((s - now).total_seconds())
-        h, m = wait // 3600, wait % 3600 // 60
-        self.lbl_sched.config(text=f"예약됨: {s:%m/%d %H:%M} ~ {end}  (시작까지 {h}시간 {m}분)")
+        h, m, sec = wait // 3600, wait % 3600 // 60, wait % 60
+        self.lbl_sched.config(text=f"예약됨: {s:%m/%d %H:%M:%S} ~ {end}  (시작까지 {h}시간 {m}분 {sec}초)")
 
     def start_recording(self, quiet=False):
         if not self.video or self.video.get_frame() is None:
@@ -1320,6 +1386,7 @@ class App:
                 a += f" ({self.audio.error[:40]})"
             self.lbl_status.config(text=f"{v}  |  {a}")
         self._check_schedule()
+        self._update_until_label()
         if self.recording:
             t = int(time.time() - self.rec_start)
             self.lbl_time.config(text=f"{t // 3600:02d}:{t % 3600 // 60:02d}:{t % 60:02d}")
@@ -1374,7 +1441,8 @@ class App:
             resolution=self.cb_res.get(), fps=self.cb_fps.get(),
             out_dir=self.var_dir.get(), monitor=self.var_mon.get(),
             sched_mode=self.var_s_mode.get(), sched_start=self.var_s_start.get().strip(),
-            sched_end=self.var_s_end.get().strip(), sched_minutes=self.var_s_min.get().strip(),
+            sched_end=self.var_s_end.get().strip(),
+            sched_duration=":".join(v.get().strip() or "0" for v in (self.var_s_h, self.var_s_m, self.var_s_s)),
             trim_after=self.var_trim_after.get(),
             geometry=f"+{self.root.winfo_x()}+{self.root.winfo_y()}",
             tab=str(self.nb.index("current")))
