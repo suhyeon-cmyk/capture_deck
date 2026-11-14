@@ -4,6 +4,7 @@ CaptureDeck - USB3 캡쳐 프로그램 (OBS 대체용, Windows)
 - 영상 + 오디오 캡쳐, MP4 녹화
 - 장치 신호가 끊기면 자동 재연결
 - 마지막 설정을 자동 저장 (매번 세팅할 필요 없음)
+- 녹화 복구: MP4로 합치지 못하고 남은 임시 파일(.tmp.mkv + .tmp.wav)을 다시 MP4로
 
 설치:  pip install opencv-python sounddevice numpy pillow pygrabber imageio-ffmpeg
 실행:  python usb3_capture.py
@@ -218,6 +219,73 @@ def video_encoder_args():
             ok = False
         _ENCODER = nvenc if ok else ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "20"]
     return _ENCODER + ["-pix_fmt", "yuv420p"]
+
+
+NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
+
+def probe_media(path):
+    """ffmpeg로 파일 정보 확인 → (열리는지, 길이 초 또는 None)"""
+    try:
+        p = subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-i", path],
+                           capture_output=True, creationflags=NO_WINDOW, timeout=60)
+    except Exception:
+        return False, None
+    info = p.stderr.decode("utf-8", "replace")
+    m = re.search(r"Duration: (\d+):(\d+):(\d+(?:\.\d+)?)", info)
+    dur = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3)) if m else None
+    return "Stream #" in info, dur
+
+
+def mux_to_mp4(vid, wav, out, progress=None):
+    """녹화 임시 파일(영상 .mkv + 소리 .wav) → .mp4
+    영상은 재인코딩 없이 복사, 소리만 AAC로 변환. 다 만든 뒤에만 out 이름으로 바꾸므로
+    중간에 끊겨도 깨진 out 파일이 생기지 않음.
+    progress(처리한 초, 전체 초 또는 None)로 진행 상황 전달. → (성공 여부, 오류 내용, 명령)"""
+    part = os.path.splitext(out)[0] + ".part.mp4"
+    total = probe_media(vid)[1] if progress else None
+    cmd = [imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-loglevel", "error", "-progress", "pipe:1", "-i", vid]
+    if wav:
+        cmd += ["-i", wav, "-map", "0:v", "-map", "1:a"]
+    # (+faststart는 큰 파일을 한 번 더 통째로 다시 쓰므로 사용하지 않음)
+    cmd += ["-c:v", "copy"]
+    if wav:
+        cmd += ["-c:a", "aac", "-b:a", "192k", "-shortest"]
+    cmd += [part]
+    err = []
+    try:
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, errors="replace", creationflags=NO_WINDOW)
+        # 오류 출력이 많아도 막히지 않도록 따로 읽음
+        t = threading.Thread(target=lambda: err.append(p.stderr.read()), daemon=True)
+        t.start()
+        for line in p.stdout:
+            if progress and line.startswith("out_time_us="):
+                v = line.strip()[12:]
+                if v.isdigit():
+                    progress(int(v) / 1e6, total)
+        ok = p.wait() == 0 and os.path.exists(part)
+        t.join(5)
+        if ok:
+            os.replace(part, out)
+    except Exception as ex:
+        err.append(repr(ex))
+        ok = False
+    if not ok:
+        try:
+            os.remove(part)
+        except OSError:
+            pass
+    return ok, ("".join(err) if not ok else ""), cmd
+
+
+def write_mux_log(base, cmd, err):
+    """변환 실패 원인 확인용 로그 (base.log)"""
+    try:
+        with open(base + ".log", "w", encoding="utf-8") as f:
+            f.write(" ".join(cmd) + "\n\n" + err)
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------- 영상 워커
@@ -869,6 +937,222 @@ class TrimPanel(ttk.Frame):
         return True
 
 
+def fmt_secs(s):
+    s = int(s)
+    return f"{s // 3600}:{s % 3600 // 60:02d}:{s % 60:02d}"
+
+
+def fmt_size(n):
+    return f"{n / 1024 ** 3:.2f} GB" if n >= 1024 ** 3 else f"{n / 1024 ** 2:.0f} MB"
+
+
+class RecoverPanel(ttk.Frame):
+    """'녹화 복구' 탭: MP4로 합치지 못하고 남은 임시 파일(.tmp.mkv 영상 + .tmp.wav 소리)을 다시 MP4로 만듦"""
+    COLS = (("file", "녹화 파일", 230), ("time", "녹화 시각", 140), ("len", "길이", 80),
+            ("size", "크기", 80), ("audio", "소리", 60), ("mp4", "기존 MP4", 110), ("state", "상태", 230))
+
+    def __init__(self, master, get_dir, get_active, on_idle):
+        super().__init__(master)
+        self.get_dir = get_dir        # 기본 폴더 (캡쳐 저장 폴더)
+        self.get_active = get_active  # 지금 녹화/변환 중인 파일 (목록에서 제외)
+        self.on_idle = on_idle        # 복구 작업이 모두 끝났을 때 호출
+        self.busy = False
+        self.scan_id = 0
+        self._build()
+
+    def _build(self):
+        top = ttk.Frame(self)
+        top.pack(fill="x", padx=8, pady=(8, 4))
+        ttk.Label(top, text="폴더").pack(side="left")
+        self.var_dir = tk.StringVar()
+        ent = ttk.Entry(top, textvariable=self.var_dir, width=60)
+        ent.pack(side="left", padx=6)
+        ent.bind("<Return>", lambda e: self.refresh())
+        self.btn_dir = ttk.Button(top, text="폴더 선택", command=self.choose_dir)
+        self.btn_dir.pack(side="left")
+        self.btn_refresh = ttk.Button(top, text="새로 고침", command=self.refresh)
+        self.btn_refresh.pack(side="left", padx=4)
+        ttk.Button(top, text="폴더 열기", command=self.open_dir).pack(side="left")
+
+        ttk.Label(self, foreground="#555", justify="left", text=(
+            "녹화 중 프로그램이 꺼지거나 MP4 변환이 실패하면 영상(.tmp.mkv)과 소리(.tmp.wav)가 따로 남아요. "
+            "여기서 다시 하나의 MP4로 합칠 수 있어요.\n"
+            "기존 MP4가 깨져 있으면 복구한 파일로 바꾸고, 정상이면 '_복구.mp4'로 따로 저장해요.")
+        ).pack(fill="x", padx=8, pady=(0, 6))
+
+        box = ttk.Frame(self)
+        box.pack(fill="both", expand=True, padx=8)
+        self.tree = ttk.Treeview(box, columns=[c[0] for c in self.COLS], show="headings", height=14)
+        for key, title, w in self.COLS:
+            self.tree.heading(key, text=title)
+            self.tree.column(key, width=w, anchor="w" if key in ("file", "state") else "center",
+                             stretch=key in ("file", "state"))
+        sb = ttk.Scrollbar(box, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="left", fill="y")
+        self.tree.bind("<Double-1>", lambda e: self.recover_selected())
+
+        bot = ttk.Frame(self)
+        bot.pack(fill="x", padx=8, pady=8)
+        self.btn_sel = ttk.Button(bot, text="선택 항목 복구", command=self.recover_selected)
+        self.btn_sel.pack(side="left")
+        self.btn_all = ttk.Button(bot, text="전체 복구", command=self.recover_all)
+        self.btn_all.pack(side="left", padx=6)
+        self.var_del = tk.BooleanVar(value=True)
+        self.chk_del = ttk.Checkbutton(bot, text="복구에 성공하면 임시 파일(.tmp.mkv / .tmp.wav) 삭제",
+                                       variable=self.var_del)
+        self.chk_del.pack(side="left", padx=12)
+        self.prog = ttk.Progressbar(self, mode="determinate", maximum=100)
+        self.prog.pack(fill="x", padx=8)
+        self.lbl_status = ttk.Label(self, text="")
+        self.lbl_status.pack(fill="x", padx=8, pady=(4, 8))
+
+    def _ui(self, fn, *args):
+        """작업 스레드 → 화면 갱신 (창이 이미 닫혔으면 무시)"""
+        try:
+            self.after(0, fn, *args)
+        except (RuntimeError, tk.TclError):
+            pass
+
+    def _set(self, base, col, text):
+        if self.tree.exists(base):
+            self.tree.set(base, col, text)
+
+    # ---- 폴더
+    def shown(self):
+        """탭이 열릴 때 호출 - 처음엔 캡쳐 저장 폴더로 시작"""
+        if not self.var_dir.get().strip():
+            self.var_dir.set(self.get_dir())
+        if not self.busy:
+            self.refresh()
+
+    def choose_dir(self):
+        d = filedialog.askdirectory(parent=self, initialdir=self.var_dir.get() or self.get_dir())
+        if d:
+            self.var_dir.set(os.path.normpath(d))
+            self.refresh()
+
+    def open_dir(self):
+        d = self.var_dir.get().strip()
+        if os.path.isdir(d):
+            os.startfile(d)
+
+    # ---- 목록
+    def refresh(self):
+        if self.busy:
+            return
+        self.scan_id += 1
+        self.tree.delete(*self.tree.get_children())
+        self.prog.config(value=0)
+        d = self.var_dir.get().strip()
+        if not os.path.isdir(d):
+            self.lbl_status.config(text="폴더를 찾을 수 없어요.")
+            return
+        active = self.get_active()
+        bases = []
+        for name in sorted(os.listdir(d), reverse=True):  # 최근 녹화가 위로
+            if not name.lower().endswith(".tmp.mkv"):
+                continue
+            base = os.path.join(d, name[:-len(".tmp.mkv")])
+            if active and os.path.normcase(base) == os.path.normcase(active):
+                continue  # 지금 녹화/변환 중인 파일
+            m = re.search(r"(\d{8})_(\d{6})$", base)
+            when = (datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S").strftime("%Y-%m-%d %H:%M:%S")
+                    if m else "")
+            wav = base + ".tmp.wav"
+            size = os.path.getsize(base + ".tmp.mkv") + (os.path.getsize(wav) if os.path.exists(wav) else 0)
+            self.tree.insert("", "end", iid=base, values=(
+                os.path.basename(base), when, "확인 중...", fmt_size(size),
+                "있음" if os.path.exists(wav) else "없음",
+                "확인 중..." if os.path.exists(base + ".mp4") else "없음", "복구 대기"))
+            bases.append(base)
+        self.lbl_status.config(text=f"복구할 수 있는 녹화 {len(bases)}개" if bases
+                               else "복구할 녹화가 없어요. (남아 있는 임시 파일 없음)")
+        if bases:
+            threading.Thread(target=self._probe_all, args=(self.scan_id, bases), daemon=True).start()
+
+    def _probe_all(self, scan_id, bases):
+        """길이와 기존 MP4가 열리는지 확인 (오래 걸릴 수 있어 별도 스레드)"""
+        for base in bases:
+            if scan_id != self.scan_id:
+                return
+            dur = probe_media(base + ".tmp.mkv")[1]
+            self._ui(self._set, base, "len", fmt_secs(dur) if dur else "알 수 없음")
+            if os.path.exists(base + ".mp4"):
+                ok = probe_media(base + ".mp4")[0]
+                self._ui(self._set, base, "mp4", "정상" if ok else "깨짐 (열리지 않음)")
+
+    # ---- 복구
+    def recover_selected(self):
+        sel = list(self.tree.selection())
+        if not sel:
+            messagebox.showinfo("녹화 복구", "목록에서 복구할 녹화를 골라 주세요.", parent=self)
+            return
+        self._start(sel)
+
+    def recover_all(self):
+        self._start(list(self.tree.get_children()))
+
+    def _start(self, bases):
+        if self.busy or not bases:
+            return
+        self.busy = True
+        self.scan_id += 1  # 진행 중인 확인 작업은 멈춤
+        for w in (self.btn_sel, self.btn_all, self.btn_refresh, self.btn_dir, self.chk_del):
+            w.config(state="disabled")
+        threading.Thread(target=self._run, args=(bases, self.var_del.get()), daemon=True).start()
+
+    def _run(self, bases, delete_tmp):
+        done = 0
+        n = len(bases)
+        for i, base in enumerate(bases):
+            vid, wav, mp4 = base + ".tmp.mkv", base + ".tmp.wav", base + ".mp4"
+            if not os.path.exists(vid):
+                self._ui(self._set, base, "state", "영상 파일이 없어요")
+                continue
+            name = os.path.basename(base)
+            self._ui(self._set, base, "state", "복구 중...")
+            self._ui(self.lbl_status.config, {"text": f"복구 중 ({i + 1}/{n}): {name}"})
+            out = mp4
+            if os.path.exists(mp4) and probe_media(mp4)[0]:  # 정상 MP4는 덮어쓰지 않음
+                out, k = base + "_복구.mp4", 2
+                while os.path.exists(out):
+                    out, k = f"{base}_복구{k}.mp4", k + 1
+
+            def progress(sec, total, base=base, i=i):
+                if total:
+                    pct = min(100.0, sec / total * 100)
+                    self._ui(self._set, base, "state", f"복구 중... {pct:.0f}%")
+                    self._ui(self.prog.config, {"value": (i + pct / 100) / n * 100})
+                else:
+                    self._ui(self._set, base, "state", f"복구 중... {fmt_secs(sec)}")
+
+            ok, err, cmd = mux_to_mp4(vid, wav if os.path.exists(wav) else None, out, progress)
+            if ok:
+                done += 1
+                if delete_tmp:
+                    for f in (vid, wav, base + ".log"):
+                        try:
+                            os.remove(f)
+                        except OSError:
+                            pass
+                self._ui(self._set, base, "state", f"완료 → {os.path.basename(out)}")
+                self._ui(self._set, base, "mp4", "정상")
+            else:
+                write_mux_log(base, cmd, err)
+                self._ui(self._set, base, "state", f"실패 (원인: {name}.log)")
+        self._ui(self._finish, done, n)
+
+    def _finish(self, done, n):
+        self.busy = False
+        for w in (self.btn_sel, self.btn_all, self.btn_refresh, self.btn_dir, self.chk_del):
+            w.config(state="normal")
+        self.prog.config(value=100 if done == n else self.prog["value"])
+        self.lbl_status.config(text=f"복구 완료: {done}개 성공" + (f", {n - done}개 실패" if done < n else ""))
+        self.on_idle()
+
+
 # ---------------------------------------------------------------- 메인 앱
 class App:
     def __init__(self, root):
@@ -885,6 +1169,7 @@ class App:
         self.rec_start = 0.0
         self.rec_base = None
         self.busy = False
+        self.close_pending = False  # MP4 변환 중 창을 닫으면 변환 후 종료
         self.last_audio_try = 0.0
         self.photo = None
         self.sched = None          # 예약된 (시작, 종료) datetime
@@ -906,7 +1191,11 @@ class App:
         self.nb.add(r, text="  영상 캡쳐  ")
         self.trim = TrimPanel(self.nb, get_dir=lambda: self.var_dir.get())
         self.nb.add(self.trim, text="  영상 자르기  ")
-        self.nb.bind("<<NotebookTabChanged>>", lambda e: self.trim.pause())
+        self.recover = RecoverPanel(self.nb, get_dir=lambda: self.var_dir.get(),
+                                    get_active=lambda: self.rec_base if (self.recording or self.busy) else None,
+                                    on_idle=self._maybe_close)
+        self.nb.add(self.recover, text="  녹화 복구  ")
+        self.nb.bind("<<NotebookTabChanged>>", self._on_tab)
         self.root.bind("<space>", self._on_space)
 
         self.preview = tk.Label(r, bg="black", width=PREVIEW_W, height=PREVIEW_H)
@@ -1250,7 +1539,7 @@ class App:
         self.lbl_sched.config(text="예약 없음")
         for w in self.sched_inputs:
             w.config(state="normal")
-        if not self.recording:
+        if not self.recording and not self.busy:  # MP4 변환 중이면 끝날 때까지 절전 방지 유지
             keep_awake(False)
 
     def _check_schedule(self):
@@ -1306,9 +1595,7 @@ class App:
         return True
 
     def stop_recording(self):
-        self.recording = False
-        if not self.sched:
-            keep_awake(False)
+        self.recording = False  # 절전 방지는 MP4 변환이 끝난 뒤(_mux_done)에 풀어 줌
         self.video.stop_rec()
         if self.audio:
             self.audio.stop_rec()
@@ -1320,27 +1607,17 @@ class App:
     def _mux(self, base, has_audio, sync=False):
         vid, wav, out = base + ".tmp.mkv", base + ".tmp.wav", base + ".mp4"
         self.video.wait_rec()
-        cmd = [imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-i", vid]
-        if has_audio:
-            cmd += ["-i", wav]
-        # 영상은 녹화 중 이미 H.264로 인코딩됨 → 재인코딩 없이 복사
-        cmd += ["-c:v", "copy", "-movflags", "+faststart"]
-        if has_audio:
-            cmd += ["-c:a", "aac", "-b:a", "192k", "-shortest"]
-        cmd += [out]
-        try:
-            flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-            p = subprocess.run(cmd, capture_output=True, creationflags=flags)
-            ok = p.returncode == 0 and os.path.exists(out)
-        except Exception:
-            ok = False
+        ok, err, cmd = mux_to_mp4(vid, wav if has_audio else None, out)
         if ok:
             for f in (vid, wav):
                 try:
                     os.remove(f)
                 except OSError:
                     pass
-        msg = f"저장 완료: {out}" if ok else f"변환 실패 - 임시 파일이 남아 있어요: {vid}"
+        else:
+            write_mux_log(base, cmd, err)
+        msg = (f"저장 완료: {out}" if ok
+               else f"변환 실패 - '녹화 복구' 탭에서 다시 시도할 수 있어요 (원인: {os.path.basename(base)}.log)")
         if not sync:
             self.root.after(0, self._mux_done, msg, out if ok else None)
         return ok
@@ -1348,6 +1625,11 @@ class App:
     def _mux_done(self, msg, out=None):
         self.busy = False
         self.lbl_status.config(text=msg)
+        if not self.recording and not self.sched:
+            keep_awake(False)
+        if self.close_pending:  # 변환 중에 창을 닫았으면 이제 종료
+            self._maybe_close()
+            return
         if out and self.var_trim_after.get() and not self.recording and self.trim.load(out):
             self.nb.select(self.trim)
 
@@ -1392,7 +1674,27 @@ class App:
             self.lbl_time.config(text=f"{t // 3600:02d}:{t % 3600 // 60:02d}:{t % 60:02d}")
         self.root.after(33, self.tick)
 
+    def _on_tab(self, ev=None):
+        self.trim.pause()
+        if self.nb.select() == str(self.recover):
+            self.recover.shown()
+
+    def _maybe_close(self):
+        """변환/복구 중에 창을 닫았던 경우, 모두 끝났으면 종료"""
+        if self.close_pending and not self.busy and not self.recover.busy:
+            self.on_close()
+
     def on_close(self):
+        if self.busy or self.recover.busy:  # MP4 변환/복구 중에 끄면 파일이 깨지므로 끝날 때까지 기다림
+            if self.close_pending:
+                return
+            what = "녹화 파일을 MP4로 변환" if self.busy else "녹화를 복구"
+            if messagebox.askyesno("종료", f"{what}하고 있어요.\n"
+                                         "지금 끄면 파일이 깨질 수 있어요. 끝나면 자동으로 종료할까요?"):
+                self.close_pending = True
+                self.lbl_status.config(text="작업이 끝나면 자동으로 종료해요...")
+                self.recover.lbl_status.config(text="복구가 끝나면 자동으로 종료해요...")
+            return
         if self.recording and not messagebox.askyesno("종료", "녹화 중이에요. 녹화를 저장하고 종료할까요?"):
             return
         if not self.trim.close():
