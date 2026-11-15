@@ -5,6 +5,7 @@ CaptureDeck - USB3 캡쳐 프로그램 (OBS 대체용, Windows)
 - 장치 신호가 끊기면 자동 재연결
 - 마지막 설정을 자동 저장 (매번 세팅할 필요 없음)
 - 녹화 복구: MP4로 합치지 못하고 남은 임시 파일(.tmp.mkv + .tmp.wav)을 다시 MP4로
+- 용량 줄이기: 영상을 다시 인코딩해 용량을 줄임 (자르기 저장 시 한 번에 적용도 가능)
 
 설치:  pip install opencv-python sounddevice numpy pillow pygrabber imageio-ffmpeg
 실행:  python usb3_capture.py
@@ -62,6 +63,8 @@ DEFAULTS = {
     "sched_mode": "range", "sched_start": "09:00:00", "sched_end": "10:00:00", "sched_minutes": "60",
     "sched_duration": "",  # 지금부터 녹화할 시간 "H:M:S" (비어 있으면 sched_minutes 사용 - 예전 설정 호환)
     "trim_after": True, "geometry": "", "tab": "0",
+    # 용량 줄이기 (자르기 탭의 '용량 줄이기 설정으로 저장'도 이 설정을 씀)
+    "enc_quality": "보통 (추천)", "enc_res": "원본", "enc_fps": "30fps", "enc_gpu": False, "trim_compress": True,
 }
 
 
@@ -224,17 +227,62 @@ def video_encoder_args():
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 
-def probe_media(path):
-    """ffmpeg로 파일 정보 확인 → (열리는지, 길이 초 또는 None)"""
+def media_info(path):
+    """ffmpeg로 파일 정보 확인 → {ok: 열리는지, dur: 길이 초, fps, w, h} (모르면 None)"""
+    r = {"ok": False, "dur": None, "fps": None, "w": None, "h": None}
     try:
         p = subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-i", path],
                            capture_output=True, creationflags=NO_WINDOW, timeout=60)
     except Exception:
-        return False, None
+        return r
     info = p.stderr.decode("utf-8", "replace")
+    r["ok"] = "Stream #" in info
     m = re.search(r"Duration: (\d+):(\d+):(\d+(?:\.\d+)?)", info)
-    dur = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3)) if m else None
-    return "Stream #" in info, dur
+    if m:
+        r["dur"] = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+    v = re.search(r"Stream #.*Video:.*?(\d{2,5})x(\d{2,5})", info)
+    if v:
+        r["w"], r["h"] = int(v.group(1)), int(v.group(2))
+    f = re.search(r"Stream #.*Video:.*?([\d.]+) fps", info)
+    if f:
+        r["fps"] = float(f.group(1))
+    return r
+
+
+def probe_media(path):
+    """→ (열리는지, 길이 초 또는 None)"""
+    r = media_info(path)
+    return r["ok"], r["dur"]
+
+
+# ---- 용량 줄이기 (재인코딩) 설정
+ENC_QUALITY = (("고화질", 21), ("보통 (추천)", 24), ("작게", 27))  # x264 CRF (낮을수록 고화질·큰 용량)
+ENC_RES = ("원본", "1080p", "720p")
+ENC_FPS = ("원본", "30fps")
+BELOW_NORMAL = 0x00004000 if sys.platform == "win32" else 0  # 녹화가 우선이도록 낮은 우선순위로 인코딩
+
+
+def nvenc_available():
+    """GPU 인코더(NVENC)를 쓸 수 있는지 (처음 한 번 확인하는 데 몇 초 걸릴 수 있음)"""
+    video_encoder_args()
+    return _ENCODER[1] == "h264_nvenc"
+
+
+def compress_args(quality, res, fps, gpu, info):
+    """용량 줄이기 설정 → ffmpeg 출력 옵션 (영상 필터 + 영상/소리 인코더). info는 media_info() 결과"""
+    crf = dict(ENC_QUALITY).get(quality, 24)
+    vf = []
+    if fps == "30fps" and (info.get("fps") or 60) > 31:
+        vf.append("fps=30")
+    target = {"1080p": 1080, "720p": 720}.get(res)
+    if target and (info.get("h") or 9999) > target:  # 줄이기만 하고 키우지는 않음
+        vf.append(f"scale=-2:{target}:flags=lanczos")
+    if gpu:
+        vargs = ["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", str(crf + 2), "-b:v", "0"]
+    else:
+        vargs = ["-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf)]
+    return ((["-vf", ",".join(vf)] if vf else []) + vargs
+            + ["-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k"])
 
 
 def mux_to_mp4(vid, wav, out, progress=None):
@@ -544,6 +592,9 @@ class TrimPanel(ttk.Frame):
     def __init__(self, master, get_dir):
         super().__init__(master)
         self.get_dir = get_dir  # 파일 열기 기본 폴더
+        self.get_compress = None    # '용량 줄이기' 설정 (App이 연결)
+        self.send_to_encode = None  # '용량 줄이기' 탭으로 보내기 (App이 연결)
+        self.last_out = None        # 마지막으로 잘라 저장한 파일
         self.path = None
         self.cap = None
         self.fps, self.dur, self.frame_ms = 60, 0, 1000 / 60
@@ -582,6 +633,7 @@ class TrimPanel(ttk.Frame):
         if self.cap:
             self.cap.release()
         self.cap, self.path = cap, path
+        self.last_out = None
         self.fps = cap.get(cv2.CAP_PROP_FPS) or 60
         self.dur = int(n * 1000 / self.fps)
         self.frame_ms = 1000 / self.fps
@@ -655,6 +707,11 @@ class TrimPanel(ttk.Frame):
         b.pack(fill="x", padx=8, pady=(4, 8))
         self.btn_save = ttk.Button(b, text="잘라서 저장", command=self.save)
         self.btn_save.pack(side="left")
+        # 자르면서 '용량 줄이기' 탭의 설정(화질/해상도/프레임)으로 한 번에 인코딩
+        self.var_compress = tk.BooleanVar(value=True)
+        ttk.Checkbutton(b, text="용량 줄이기 설정으로 저장", variable=self.var_compress).pack(side="left", padx=(8, 0))
+        self.btn_send = ttk.Button(b, text="용량 줄이기 탭으로 보내기", command=self._send)
+        self.btn_send.pack(side="right")
         self.prog = ttk.Progressbar(b, maximum=100, length=200)
         self.prog.pack(side="left", padx=8)
         self.lbl_status = ttk.Label(b, text="원본은 그대로 두고 '_trim' 파일로 새로 저장해요")
@@ -894,9 +951,14 @@ class TrimPanel(ttk.Frame):
             i += 1
         # 밀리초 단위로 정확히 자르기 위해 재인코딩 (복사 방식은 키프레임 단위로만 잘림)
         cmd = [imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-loglevel", "error", "-progress", "pipe:1",
-               "-ss", f"{self.start_ms / 1000:.3f}", "-i", self.path, "-t", f"{length / 1000:.3f}",
-               ] + video_encoder_args() + ["-g", str(round(self.fps)),
-                                           "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", out]
+               "-ss", f"{self.start_ms / 1000:.3f}", "-i", self.path, "-t", f"{length / 1000:.3f}"]
+        opts = self.get_compress() if (self.var_compress.get() and self.get_compress) else None
+        if opts:  # '용량 줄이기' 탭 설정으로 자르면서 한 번에 줄임
+            info = {"fps": self.fps, "h": self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)}
+            cmd += compress_args(*opts, info)
+        else:
+            cmd += video_encoder_args() + ["-g", str(round(self.fps)), "-c:a", "aac", "-b:a", "192k"]
+        cmd += ["-movflags", "+faststart", out]
         flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
         self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                      text=True, creationflags=flags)
@@ -922,8 +984,21 @@ class TrimPanel(ttk.Frame):
         self.proc = None
         self.btn_save.config(state="normal")
         self.prog.config(value=100 if ok else 0)
-        self.lbl_status.config(text=f"저장 완료: {os.path.basename(out)}" if ok
-                               else f"저장 실패: {err.strip()[:80]}")
+        if ok:
+            self.last_out = out
+            size = fmt_size(os.path.getsize(out)) if os.path.exists(out) else ""
+            self.lbl_status.config(text=f"저장 완료: {os.path.basename(out)} ({size})")
+        else:
+            self.lbl_status.config(text=f"저장 실패: {err.strip()[:80]}")
+
+    def _send(self):
+        """방금 잘라 저장한 파일(없으면 열린 영상)을 '용량 줄이기' 탭 목록에 넣음"""
+        path = self.last_out if self.last_out and os.path.exists(self.last_out) else self.path
+        if not path:
+            messagebox.showinfo("용량 줄이기", "먼저 '영상 열기'로 영상을 열어 주세요.", parent=self)
+            return
+        if self.send_to_encode:
+            self.send_to_encode(path)
 
     def close(self):
         """프로그램 종료 시 호출. 저장 중에 사용자가 취소하면 False"""
@@ -943,7 +1018,9 @@ def fmt_secs(s):
 
 
 def fmt_size(n):
-    return f"{n / 1024 ** 3:.2f} GB" if n >= 1024 ** 3 else f"{n / 1024 ** 2:.0f} MB"
+    if n >= 1024 ** 3:
+        return f"{n / 1024 ** 3:.2f} GB"
+    return f"{n / 1024 ** 2:.0f} MB" if n >= 1024 ** 2 else f"{n / 1024:.0f} KB"
 
 
 class RecoverPanel(ttk.Frame):
@@ -1153,6 +1230,306 @@ class RecoverPanel(ttk.Frame):
         self.on_idle()
 
 
+class EncodePanel(ttk.Frame):
+    """'용량 줄이기' 탭: 녹화/자른 영상을 다시 인코딩해 용량을 줄임 (원본은 그대로 두고 '_small.mp4'로 저장)"""
+    COLS = (("file", "파일", 300), ("len", "길이", 80), ("size", "원본 크기", 90),
+            ("out", "줄인 크기", 130), ("state", "상태", 250))
+
+    def __init__(self, master, get_dir, cfg, on_busy):
+        super().__init__(master)
+        self.get_dir = get_dir  # 파일 추가 기본 폴더
+        self.cfg = cfg
+        self.on_busy = on_busy  # 인코딩 시작/끝 알림 (절전 방지용)
+        self.busy = False
+        self.proc = None
+        self.stop_flag = threading.Event()
+        self.info = {}          # 경로 → media_info 결과
+        self.gpu_ok = False
+        self.worker = None
+        self.current = None
+        self.removed = set()    # 인코딩 중 목록에서 뺀 항목 (건너뜀)
+        self._build()
+        threading.Thread(target=self._check_gpu, daemon=True).start()
+
+    def _build(self):
+        top = ttk.Frame(self)
+        top.pack(fill="x", padx=8, pady=(8, 4))
+        self.btn_add = ttk.Button(top, text="파일 추가...", command=self.add_dialog)
+        self.btn_add.pack(side="left")
+        self.btn_remove = ttk.Button(top, text="목록에서 빼기", command=self.remove_selected)
+        self.btn_remove.pack(side="left", padx=4)
+        self.btn_clear = ttk.Button(top, text="끝난 항목 지우기", command=self.clear_done)
+        self.btn_clear.pack(side="left")
+        ttk.Label(top, foreground="#555",
+                  text="원본은 그대로 두고 같은 폴더에 '_small.mp4'로 저장해요").pack(side="left", padx=12)
+
+        box = ttk.Frame(self)
+        box.pack(fill="both", expand=True, padx=8)
+        self.tree = ttk.Treeview(box, columns=[c[0] for c in self.COLS], show="headings", height=12)
+        for key, title, w in self.COLS:
+            self.tree.heading(key, text=title)
+            self.tree.column(key, width=w, anchor="w" if key in ("file", "state") else "center",
+                             stretch=key in ("file", "state"))
+        sb = ttk.Scrollbar(box, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="left", fill="y")
+
+        o = ttk.LabelFrame(self, text="설정")
+        o.pack(fill="x", padx=8, pady=8)
+        ttk.Label(o, text="화질").grid(row=0, column=0, sticky="w", padx=(8, 4), pady=4)
+        self.var_q = tk.StringVar(value=self.cfg.get("enc_quality") or ENC_QUALITY[1][0])
+        if self.var_q.get() not in dict(ENC_QUALITY):
+            self.var_q.set(ENC_QUALITY[1][0])
+        qf = ttk.Frame(o)
+        qf.grid(row=0, column=1, sticky="w")
+        self.opt_widgets = []
+        for name, _ in ENC_QUALITY:
+            rb = ttk.Radiobutton(qf, text=name, value=name, variable=self.var_q)
+            rb.pack(side="left", padx=(0, 10))
+            self.opt_widgets.append(rb)
+        ttk.Label(o, text="해상도").grid(row=0, column=2, sticky="w", padx=(16, 4))
+        self.cb_res = ttk.Combobox(o, values=ENC_RES, state="readonly", width=7)
+        self.cb_res.set(self.cfg.get("enc_res") if self.cfg.get("enc_res") in ENC_RES else "원본")
+        self.cb_res.grid(row=0, column=3, sticky="w")
+        ttk.Label(o, text="프레임").grid(row=0, column=4, sticky="w", padx=(16, 4))
+        self.cb_fps = ttk.Combobox(o, values=ENC_FPS, state="readonly", width=7)
+        self.cb_fps.set(self.cfg.get("enc_fps") if self.cfg.get("enc_fps") in ENC_FPS else "30fps")
+        self.cb_fps.grid(row=0, column=5, sticky="w")
+        self.var_gpu = tk.BooleanVar(value=False)
+        self.chk_gpu = ttk.Checkbutton(o, text="GPU로 빠르게 (확인 중...)", variable=self.var_gpu, state="disabled")
+        self.chk_gpu.grid(row=0, column=6, sticky="w", padx=(16, 8))
+        self.opt_widgets += [self.cb_res, self.cb_fps]
+        ttk.Label(o, foreground="#555", justify="left", text=(
+            "강의 영상 45분 기준 (원본 약 5.2GB): 고화질 약 1.1GB · 보통 약 0.7GB · 작게+720p 약 0.3GB\n"
+            "강의처럼 움직임이 적은 영상은 30fps로 줄여도 티가 거의 안 나요. 녹화 중에도 쓸 수 있지만 "
+            "녹화가 우선이라 인코딩은 느려질 수 있어요.")).grid(row=1, column=0, columnspan=7, sticky="w",
+                                                         padx=8, pady=(0, 6))
+
+        bot = ttk.Frame(self)
+        bot.pack(fill="x", padx=8)
+        self.btn_start = ttk.Button(bot, text="용량 줄이기 시작", command=self.start)
+        self.btn_start.pack(side="left")
+        self.btn_stop = ttk.Button(bot, text="중지", command=self.stop, state="disabled")
+        self.btn_stop.pack(side="left", padx=6)
+        self.prog = ttk.Progressbar(bot, mode="determinate", maximum=100)
+        self.prog.pack(side="left", fill="x", expand=True, padx=8)
+        self.lbl_status = ttk.Label(self, text="'파일 추가'로 줄일 영상을 고르세요. 자르기 탭에서 보낼 수도 있어요.")
+        self.lbl_status.pack(fill="x", padx=8, pady=(4, 8))
+
+    def _ui(self, fn, *args):
+        try:
+            self.after(0, fn, *args)
+        except (RuntimeError, tk.TclError):
+            pass
+
+    def _set(self, iid, col, text):
+        if self.tree.exists(iid):
+            self.tree.set(iid, col, text)
+
+    def _check_gpu(self):
+        ok = nvenc_available()
+        def done():
+            self.gpu_ok = ok
+            if ok:
+                self.chk_gpu.config(text="GPU로 빠르게 (NVENC)", state="disabled" if self.busy else "normal")
+                self.var_gpu.set(bool(self.cfg.get("enc_gpu", False)))
+            else:
+                self.chk_gpu.config(text="GPU 사용 불가 (NVIDIA 드라이버 확인)")
+        self._ui(done)
+
+    def options(self):
+        return self.var_q.get(), self.cb_res.get(), self.cb_fps.get(), bool(self.var_gpu.get())
+
+    def save_options(self):
+        q, r, f, g = self.options()
+        self.cfg.update(enc_quality=q, enc_res=r, enc_fps=f, enc_gpu=g)
+
+    # ---- 목록
+    def add_dialog(self):
+        paths = filedialog.askopenfilenames(
+            parent=self, title="용량을 줄일 영상 선택", initialdir=self.get_dir(),
+            filetypes=[("영상 파일", "*.mp4 *.mkv *.mov *.avi"), ("모든 파일", "*.*")])
+        self.add_files(paths)
+
+    def add_files(self, paths):
+        new = []
+        for p in paths:
+            p = os.path.normpath(p)
+            if self.tree.exists(p) or not os.path.isfile(p):
+                continue
+            self.tree.insert("", "end", iid=p, values=(
+                os.path.basename(p), "확인 중...", fmt_size(os.path.getsize(p)), "", "대기"))
+            new.append(p)
+        if new:
+            self.lbl_status.config(text=f"{len(new)}개 추가했어요. 설정을 고른 뒤 '용량 줄이기 시작'을 누르세요.")
+            threading.Thread(target=self._probe, args=(new,), daemon=True).start()
+
+    def _probe(self, paths):
+        for p in paths:
+            info = media_info(p)
+            self.info[p] = info
+            self._ui(self._set, p, "len", fmt_secs(info["dur"]) if info["dur"] else "알 수 없음")
+            if not info["ok"]:
+                self._ui(self._set, p, "state", "열 수 없는 파일")
+
+    def remove_selected(self):
+        for iid in self.tree.selection():
+            if not (self.busy and iid == self.current):
+                self.removed.add(iid)
+                self.tree.delete(iid)
+
+    def clear_done(self):
+        for iid in self.tree.get_children():
+            if self.tree.set(iid, "state").startswith("완료"):
+                self.tree.delete(iid)
+
+    # ---- 인코딩
+    def start(self):
+        if self.busy:
+            return
+        todo = [i for i in self.tree.get_children() if not self.tree.set(i, "state").startswith("완료")]
+        if not todo:
+            messagebox.showinfo("용량 줄이기", "줄일 영상이 없어요. '파일 추가'로 영상을 골라 주세요.", parent=self)
+            return
+        self.save_options()
+        save_config(self.cfg)
+        self.busy = True
+        self.current = None
+        self.removed.clear()
+        self.stop_flag.clear()
+        self._set_inputs("disabled")
+        self.btn_stop.config(state="normal")
+        self.on_busy(True)
+        self.worker = threading.Thread(target=self._run, args=(todo, self.options()), daemon=True)
+        self.worker.start()
+
+    def _set_inputs(self, state):
+        widgets = [self.btn_start, self.btn_add, self.btn_clear, *self.opt_widgets]
+        if self.gpu_ok:
+            widgets.append(self.chk_gpu)
+        for w in widgets:
+            w.config(state=("readonly" if isinstance(w, ttk.Combobox) and state == "normal" else state))
+
+    def _out_path(self, src):
+        base = os.path.splitext(src)[0]
+        out, k = base + "_small.mp4", 2
+        while os.path.exists(out):
+            out, k = f"{base}_small{k}.mp4", k + 1
+        return out
+
+    def _run(self, todo, opts):
+        done = failed = 0
+        before = after = 0
+        n = len(todo)
+        for i, src in enumerate(todo):
+            if self.stop_flag.is_set():
+                break
+            if src in self.removed:
+                continue
+            if not os.path.isfile(src):
+                self._ui(self._set, src, "state", "파일이 없어요")
+                failed += 1
+                continue
+            self.current = src
+            info = self.info.get(src) or media_info(src)
+            self.info[src] = info
+            out = self._out_path(src)
+            part = os.path.splitext(out)[0] + ".part.mp4"
+            cmd = ([imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-loglevel", "error", "-progress", "pipe:1",
+                    "-i", src, "-map", "0:v:0", "-map", "0:a?"]
+                   + compress_args(*opts, info) + ["-movflags", "+faststart", part])
+            name = os.path.basename(src)
+            self._ui(self.lbl_status.config, {"text": f"줄이는 중 ({i + 1}/{n}): {name}"})
+            self._ui(self._set, src, "state", "인코딩 중...")
+            err = []
+            t0 = time.time()
+            try:
+                self.proc = p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                                 errors="replace", creationflags=NO_WINDOW | BELOW_NORMAL)
+                et = threading.Thread(target=lambda: err.append(p.stderr.read()), daemon=True)
+                et.start()
+                last = 0.0
+                for line in p.stdout:
+                    if line.startswith("out_time_us=") and line.strip()[12:].isdigit() and info["dur"]:
+                        pct = min(100.0, int(line.strip()[12:]) / 1e6 / info["dur"] * 100)
+                        now = time.time()
+                        if now - last > 0.5:
+                            last = now
+                            left = (now - t0) / pct * (100 - pct) if pct > 1 else None
+                            eta = f" (남은 시간 약 {fmt_secs(left)})" if left else ""
+                            self._ui(self._set, src, "state", f"인코딩 중 {pct:.0f}%{eta}")
+                            self._ui(self.prog.config, {"value": (i + pct / 100) / n * 100})
+                ok = p.wait() == 0 and os.path.exists(part) and not self.stop_flag.is_set()
+                et.join(5)
+                if ok:
+                    os.replace(part, out)
+            except Exception as ex:
+                err.append(repr(ex))
+                ok = False
+            self.proc = None
+            if not ok:
+                try:
+                    os.remove(part)
+                except OSError:
+                    pass
+            if self.stop_flag.is_set():
+                self._ui(self._set, src, "state", "중지됨")
+                break
+            if ok:
+                done += 1
+                a, b = os.path.getsize(src), os.path.getsize(out)
+                before, after = before + a, after + b
+                self._ui(self._set, src, "out", f"{fmt_size(b)} ({b / a * 100:.0f}%)")
+                self._ui(self._set, src, "state", f"완료 → {os.path.basename(out)}")
+            else:
+                failed += 1
+                msg = " ".join("".join(err).split())[:80] or "알 수 없는 오류"
+                self._ui(self._set, src, "state", f"실패: {msg}")
+        self._ui(self._finish, done, failed, before, after)
+
+    def _finish(self, done, failed, before, after):
+        self.busy = False
+        self.current = None
+        self._set_inputs("normal")
+        self.btn_stop.config(state="disabled")
+        if self.stop_flag.is_set():
+            self.prog.config(value=0)
+            self.lbl_status.config(text="중지했어요. 만들던 파일은 지웠어요.")
+        else:
+            self.prog.config(value=100 if done and not failed else self.prog["value"])
+            text = f"완료: {done}개"
+            if failed:
+                text += f", 실패 {failed}개"
+            if before:
+                text += f"  ·  {fmt_size(before)} → {fmt_size(after)} ({after / before * 100:.0f}%)"
+            self.lbl_status.config(text=text)
+        self.on_busy(False)
+
+    def stop(self):
+        if not self.busy:
+            return
+        self.stop_flag.set()
+        p = self.proc
+        if p is not None:
+            try:
+                p.kill()
+            except OSError:
+                pass
+
+    def close(self):
+        """프로그램 종료 시 호출. 인코딩 중에 사용자가 취소하면 False"""
+        if not self.busy:
+            return True
+        if not messagebox.askyesno("종료", "용량 줄이기 인코딩 중이에요.\n중단하고 종료할까요? (만들던 파일은 지워져요)",
+                                   parent=self):
+            return False
+        self.stop()
+        if self.worker is not None:
+            self.worker.join(5)  # 만들던 파일(.part.mp4) 정리를 기다림
+        return True
+
+
 # ---------------------------------------------------------------- 메인 앱
 class App:
     def __init__(self, root):
@@ -1195,6 +1572,12 @@ class App:
                                     get_active=lambda: self.rec_base if (self.recording or self.busy) else None,
                                     on_idle=self._maybe_close)
         self.nb.add(self.recover, text="  녹화 복구  ")
+        self.encode = EncodePanel(self.nb, get_dir=lambda: self.var_dir.get(), cfg=self.cfg,
+                                  on_busy=self._on_encode_busy)
+        self.nb.add(self.encode, text="  용량 줄이기  ")
+        self.trim.get_compress = self.encode.options
+        self.trim.send_to_encode = self._send_to_encode
+        self.trim.var_compress.set(bool(self.cfg.get("trim_compress", True)))
         self.nb.bind("<<NotebookTabChanged>>", self._on_tab)
         self.root.bind("<space>", self._on_space)
 
@@ -1679,6 +2062,17 @@ class App:
         if self.nb.select() == str(self.recover):
             self.recover.shown()
 
+    def _send_to_encode(self, path):
+        self.encode.add_files([path])
+        self.nb.select(self.encode)
+
+    def _on_encode_busy(self, busy):
+        """인코딩 중에는 절전 방지 (끝나면 녹화/예약/변환 중이 아닐 때만 해제)"""
+        if busy:
+            keep_awake(True)
+        elif not (self.recording or self.sched or self.busy):
+            keep_awake(False)
+
     def _maybe_close(self):
         """변환/복구 중에 창을 닫았던 경우, 모두 끝났으면 종료"""
         if self.close_pending and not self.busy and not self.recover.busy:
@@ -1698,6 +2092,8 @@ class App:
         if self.recording and not messagebox.askyesno("종료", "녹화 중이에요. 녹화를 저장하고 종료할까요?"):
             return
         if not self.trim.close():
+            return
+        if not self.encode.close():
             return
         if self.recording:
             self.recording = False
@@ -1745,9 +2141,10 @@ class App:
             sched_mode=self.var_s_mode.get(), sched_start=self.var_s_start.get().strip(),
             sched_end=self.var_s_end.get().strip(),
             sched_duration=":".join(v.get().strip() or "0" for v in (self.var_s_h, self.var_s_m, self.var_s_s)),
-            trim_after=self.var_trim_after.get(),
+            trim_after=self.var_trim_after.get(), trim_compress=self.trim.var_compress.get(),
             geometry=f"+{self.root.winfo_x()}+{self.root.winfo_y()}",
             tab=str(self.nb.index("current")))
+        self.encode.save_options()
         save_config(self.cfg)
 
 
