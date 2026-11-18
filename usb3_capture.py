@@ -53,7 +53,6 @@ KEYWORDS = ["usb3", "usb 3", "video"]  # 비디오 장치 자동 감지용 키�
 AUDIO_KEYWORDS = ["usb3", "usb 3", "plus video", "video", "디지털 오디오", "digital audio"]
 RESOLUTIONS = ["1920x1080", "1280x720", "3840x2160", "1024x768", "640x480"]
 FPS_LIST = ["60", "30", "25", "24"]
-PREVIEW_W, PREVIEW_H = 960, 540
 
 
 # ---------------------------------------------------------------- 설정
@@ -62,7 +61,7 @@ DEFAULTS = {
     "out_dir": str(Path.home() / "Videos" / "Captures"), "monitor": False,
     "sched_mode": "range", "sched_start": "09:00:00", "sched_end": "10:00:00", "sched_minutes": "60",
     "sched_duration": "",  # 지금부터 녹화할 시간 "H:M:S" (비어 있으면 sched_minutes 사용 - 예전 설정 호환)
-    "trim_after": True, "geometry": "", "tab": "0",
+    "trim_after": True, "geometry": "", "zoomed": False, "tab": "0",
     # 용량 줄이기 (자르기 탭의 '용량 줄이기 설정으로 저장'도 이 설정을 씀)
     "enc_quality": "보통 (추천)", "enc_res": "원본", "enc_fps": "30fps", "enc_gpu": False, "trim_compress": True,
 }
@@ -566,6 +565,49 @@ class AudioWorker:
         self._close_stream()
 
 
+# ---------------------------------------------------------------- 영상 표시 영역
+class FitView(tk.Frame):
+    """남는 공간을 모두 차지하고, 영상을 비율 그대로 최대한 크게 가운데에 표시하는 검은 영역
+    (자기 크기를 요구하지 않으므로 아래 조작부 높이는 그대로 두고 창 크기에 따라 늘었다 줄었다 함)"""
+
+    def __init__(self, master, min_w=320, min_h=180, on_resize=None):
+        super().__init__(master, bg="black", width=min_w, height=min_h)
+        self.label = tk.Label(self, bg="black", bd=0)
+        self.label.place(relx=0.5, rely=0.5, anchor="center")
+        self.size = (min_w, min_h)  # 다른 스레드(재생)에서도 읽으므로 tkinter 호출 없이 값으로 보관
+        self.photo = None
+        self.on_resize = on_resize
+        self._job = None
+        self.bind("<Configure>", self._on_configure)
+
+    def _on_configure(self, ev):
+        size = (max(16, ev.width), max(16, ev.height))
+        if size == self.size:
+            return
+        self.size = size
+        if self.on_resize:  # 창 크기를 끄는 동안 계속 다시 그리지 않도록 잠깐 기다렸다가 한 번만
+            if self._job:
+                self.after_cancel(self._job)
+            self._job = self.after(120, self.on_resize)
+
+    def to_rgb(self, frame):
+        """BGR 프레임 → 영역에 맞춘 크기의 RGB (어느 스레드에서나 호출 가능)"""
+        h, w = frame.shape[:2]
+        aw, ah = self.size
+        s = min(aw / w, ah / h)
+        size = (max(1, int(w * s)), max(1, int(h * s)))
+        interp = cv2.INTER_AREA if s < 1 else cv2.INTER_LINEAR
+        return cv2.cvtColor(cv2.resize(frame, size, interpolation=interp), cv2.COLOR_BGR2RGB)
+
+    def show(self, rgb):
+        img = Image.fromarray(rgb)
+        if self.photo is not None and (self.photo.width(), self.photo.height()) == img.size:
+            self.photo.paste(img)  # 기존 이미지에 덮어쓰기가 새로 만드는 것보다 빠름
+        else:
+            self.photo = ImageTk.PhotoImage(img)
+            self.label.config(image=self.photo)
+
+
 # ---------------------------------------------------------------- 영상 자르기
 def fmt_ms(ms):
     ms = max(0, int(round(ms)))
@@ -587,7 +629,6 @@ def parse_ms(text):
 
 class TrimPanel(ttk.Frame):
     """'영상 자르기' 탭: 영상의 앞뒤를 밀리초 단위로 잘라 새 파일로 저장 (원본은 그대로 둠)"""
-    VIEW_W, VIEW_H = PREVIEW_W, PREVIEW_H
 
     def __init__(self, master, get_dir):
         super().__init__(master)
@@ -602,7 +643,6 @@ class TrimPanel(ttk.Frame):
         self.start_ms = self.end_ms = 0
         self.seek_job = None
         self.proc = None
-        self.photo = None
         # 재생
         self.playing = False
         self.play_stop = threading.Event()
@@ -653,11 +693,8 @@ class TrimPanel(ttk.Frame):
         self.lbl_file = ttk.Label(t, text="열린 영상 없음 - '영상 열기'로 파일을 고르거나, 녹화가 끝나면 자동으로 열려요")
         self.lbl_file.pack(side="left", padx=8)
 
-        self.view = tk.Label(self, bg="black")
-        self.view.pack(padx=8, pady=8)
-        blank = ImageTk.PhotoImage(Image.new("RGB", (self.VIEW_W, self.VIEW_H), "black"))
-        self.view.config(image=blank)
-        self.view.image = blank
+        # 영상 영역은 아래 조작부를 뺀 나머지 공간을 모두 차지 (아래 조작부들을 먼저 아래쪽에 붙임)
+        self.view = FitView(self, on_resize=self._redraw)
 
         self.var_pos = tk.DoubleVar(value=0)
         self.scale = ttk.Scale(self, from_=0, to=max(1, self.dur), variable=self.var_pos,
@@ -716,6 +753,8 @@ class TrimPanel(ttk.Frame):
         self.prog.pack(side="left", padx=8)
         self.lbl_status = ttk.Label(b, text="원본은 그대로 두고 '_trim' 파일로 새로 저장해요")
         self.lbl_status.pack(side="left")
+        # 영상 영역: 위 파일 줄과 아래 조작부 사이의 남는 공간을 모두 차지
+        self.view.pack(fill="both", expand=True, padx=8, pady=8, before=self.scale)
 
     # ---- 이동
     def _show(self, ms):
@@ -725,17 +764,15 @@ class TrimPanel(ttk.Frame):
         ok, frame = self.cap.read()
         if not ok:
             return
-        h, w = frame.shape[:2]
-        s = min(self.VIEW_W / w, self.VIEW_H / h)
-        self._display(cv2.cvtColor(cv2.resize(frame, (int(w * s), int(h * s))), cv2.COLOR_BGR2RGB))
+        self._display(self.view.to_rgb(frame))
 
     def _display(self, rgb):
-        img = Image.fromarray(rgb)
-        if self.photo is not None and (self.photo.width(), self.photo.height()) == img.size:
-            self.photo.paste(img)  # 기존 이미지에 덮어쓰기가 새로 만드는 것보다 약 2배 빠름 (재생 시 중요)
-        else:
-            self.photo = ImageTk.PhotoImage(img)
-            self.view.config(image=self.photo)
+        self.view.show(rgb)
+
+    def _redraw(self):
+        """창 크기가 바뀌면 멈춰 있는 화면을 새 크기로 다시 그림 (재생 중이면 다음 프레임부터 자동으로 맞춰짐)"""
+        if self.cap and not self.playing:
+            self._show(self.pos)
 
     def goto(self, ms):
         if not self.cap:
@@ -830,9 +867,7 @@ class TrimPanel(ttk.Frame):
                 elif ts < self._clock() - self.frame_ms * 2 and time.perf_counter() - shown_at < 0.1:
                     continue
                 shown_at = time.perf_counter()
-                h, w = frame.shape[:2]
-                s = min(self.VIEW_W / w, self.VIEW_H / h)
-                rgb = cv2.cvtColor(cv2.resize(frame, (int(w * s), int(h * s))), cv2.COLOR_BGR2RGB)
+                rgb = self.view.to_rgb(frame)
                 while not self.play_stop.is_set() and self._clock() < ts:
                     time.sleep(0.002)
                 self.play_frame = (ts, rgb)
@@ -1548,7 +1583,6 @@ class App:
         self.busy = False
         self.close_pending = False  # MP4 변환 중 창을 닫으면 변환 후 종료
         self.last_audio_try = 0.0
-        self.photo = None
         self.sched = None          # 예약된 (시작, 종료) datetime
         self.sched_rec = False     # 지금 녹화가 예약으로 시작된 것인지
 
@@ -1581,13 +1615,10 @@ class App:
         self.nb.bind("<<NotebookTabChanged>>", self._on_tab)
         self.root.bind("<space>", self._on_space)
 
-        self.preview = tk.Label(r, bg="black", width=PREVIEW_W, height=PREVIEW_H)
-        self.preview.config(width=PREVIEW_W, height=PREVIEW_H)
-        self.preview.pack(padx=8, pady=8)
-        # 라벨 크기를 픽셀로 고정
-        blank = ImageTk.PhotoImage(Image.new("RGB", (PREVIEW_W, PREVIEW_H), "black"))
-        self.preview.config(image=blank)
-        self.preview.image = blank
+        # 미리보기: 아래 조작부(높이 고정)를 뺀 나머지 공간을 모두 차지
+        self.preview = FitView(r)
+        self.preview.pack(fill="both", expand=True, padx=8, pady=8)
+        self.prev_next = 0.0  # 다음 미리보기를 그릴 시각 (그리는 데 걸린 시간에 맞춰 조절)
 
         f = ttk.Frame(r)
         f.pack(fill="x", padx=8)
@@ -2023,15 +2054,15 @@ class App:
     # ---- 주기 업데이트
     def tick(self):
         # 미리보기 (캡쳐 탭이 보일 때만)
-        if self.video and self.nb.index("current") == 0:
+        # 미리보기가 크면 그리는 데 시간이 걸리므로, 그 시간에 맞춰 그리는 횟수를 줄임
+        # (화면 그리기가 녹화를 방해하지 않도록 녹화 중에는 더 여유를 둠)
+        now = time.perf_counter()
+        if self.video and self.nb.index("current") == 0 and now >= self.prev_next:
             frame = self.video.get_frame()
             if frame is not None and self.video.status == "영상 정상":
-                h, w = frame.shape[:2]
-                s = min(PREVIEW_W / w, PREVIEW_H / h)
-                small = cv2.resize(frame, (int(w * s), int(h * s)))
-                rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
-                self.photo = ImageTk.PhotoImage(Image.fromarray(rgb))
-                self.preview.config(image=self.photo)
+                self.preview.show(self.preview.to_rgb(frame))
+                cost = time.perf_counter() - now
+                self.prev_next = now + max(0.03, cost * (4 if self.recording else 1.5))
         # 오디오 레벨 / 재연결
         if self.audio and self.audio.running:
             lv = self.audio.level
@@ -2116,21 +2147,45 @@ class App:
             self.trim.toggle_play()
 
     def _restore_window(self):
-        """마지막 창 위치와 탭 복원 (화면 밖이면 위치는 무시)"""
-        m = re.fullmatch(r"\+(-?\d+)\+(-?\d+)", self.cfg.get("geometry", ""))
+        """마지막 창 크기·위치·최대화와 탭 복원 (화면 밖이면 위치는 무시)"""
+        self.root.update_idletasks()
+        # 아래 조작부가 잘리지 않는 최소 크기 (영상 영역은 작게 줄어들 수 있음)
+        min_w, min_h = self.root.winfo_reqwidth(), self.root.winfo_reqheight()
+        self.root.minsize(min_w, min_h)
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        vx, vy, vw, vh = 0, 0, sw, sh
+        if sys.platform == "win32":  # 모니터 여러 대를 합친 전체 화면 범위
+            import ctypes
+            gsm = ctypes.windll.user32.GetSystemMetrics
+            vx, vy, vw, vh = gsm(76), gsm(77), gsm(78), gsm(79)
+        # 예전 설정은 위치만("+x+y"), 지금은 크기까지("WxH+x+y") 저장
+        m = re.fullmatch(r"(?:(\d+)x(\d+))?\+(-?\d+)\+(-?\d+)", self.cfg.get("geometry", ""))
+        w, h = (int(m.group(1)), int(m.group(2))) if m and m.group(1) else (0, 0)
+        if w < min_w or h < min_h:  # 처음 실행: 화면의 80% 크기
+            w, h = max(min_w, int(sw * 0.8)), max(min_h, int(sh * 0.8))
+        w, h = min(w, vw), min(h, vh)
+        geo = f"{w}x{h}"
         if m:
-            x, y = int(m.group(1)), int(m.group(2))
-            vx, vy, vw, vh = 0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-            if sys.platform == "win32":  # 모니터 여러 대를 합친 전체 화면 범위
-                import ctypes
-                gsm = ctypes.windll.user32.GetSystemMetrics
-                vx, vy, vw, vh = gsm(76), gsm(77), gsm(78), gsm(79)
+            x, y = int(m.group(3)), int(m.group(4))
             if vx - 50 <= x < vx + vw - 100 and vy <= y < vy + vh - 100:
-                self.root.geometry(f"+{x}+{y}")
+                geo += f"+{x}+{y}"
+        self.root.geometry(geo)
+        if self.cfg.get("zoomed"):
+            try:
+                self.root.state("zoomed")
+            except tk.TclError:
+                pass
         try:
             self.nb.select(int(self.cfg.get("tab", 0)))
         except (ValueError, tk.TclError):
             pass
+
+    def _window_geometry(self):
+        """저장할 창 크기·위치. 최대화 상태면 최대화 여부만 바꾸고 원래 크기는 그대로 둠"""
+        zoomed = self.root.state() == "zoomed"
+        if zoomed:
+            return {"zoomed": True}
+        return {"zoomed": False, "geometry": self.root.wm_geometry()}
 
     def save_all(self):
         """현재 화면의 모든 설정을 settings.ini에 저장"""
@@ -2142,7 +2197,7 @@ class App:
             sched_end=self.var_s_end.get().strip(),
             sched_duration=":".join(v.get().strip() or "0" for v in (self.var_s_h, self.var_s_m, self.var_s_s)),
             trim_after=self.var_trim_after.get(), trim_compress=self.trim.var_compress.get(),
-            geometry=f"+{self.root.winfo_x()}+{self.root.winfo_y()}",
+            **self._window_geometry(),
             tab=str(self.nb.index("current")))
         self.encode.save_options()
         save_config(self.cfg)
