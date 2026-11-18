@@ -3,10 +3,10 @@ rem CaptureDeck.exe 빌드 (결과: dist\CaptureDeck.exe)
 chcp 65001 >nul
 cd /d "%~dp0"
 
-python -c "import PIL, PyInstaller" 2>nul
+python -c "import PIL, PyInstaller, websocket" 2>nul
 if errorlevel 1 (
   echo [오류] 빌드에 필요한 패키지가 없습니다. 아래 명령으로 설치하세요:
-  echo   python -m pip install opencv-python sounddevice numpy pillow pygrabber imageio-ffmpeg pyinstaller
+  echo   python -m pip install opencv-python sounddevice numpy pillow pygrabber imageio-ffmpeg websocket-client pyinstaller
   goto fail
 )
 
@@ -21,6 +21,7 @@ python -m PyInstaller --noconfirm --clean --onefile --windowed ^
   --collect-data imageio_ffmpeg ^
   --collect-all pygrabber ^
   --hidden-import sounddevice ^
+  --hidden-import edge_cdp --hidden-import lecture_auto --hidden-import websocket ^
   usb3_capture.py
 if errorlevel 1 goto fail
 
