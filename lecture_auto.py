@@ -12,6 +12,7 @@ import edge_cdp
 
 LIST_HOST = "myclass.hackers.com"   # 나의 강의실 (강의 목록)
 PLAYER_HOST = "class.hackers.com"   # 강의 팝업
+FS_NOTICE_SECS = 6.0  # 전체화면 알림('Esc 키를 누르세요')이 떠 있는 시간 (보통 3~4초) → 이만큼 기다렸다가 녹화
 
 # 강의 목록 읽기: [{idx, no, title, mins}]
 READ_LIST_JS = r"""
@@ -104,7 +105,13 @@ HIDE_UI_JS = r"""
   if (d.getElementById('cd-hide-ui')) return true;
   const st = d.createElement('style');
   st.id = 'cd-hide-ui';
-  st.textContent = '#controller-container2, #controller-container2 *, [class*=tooltip]' +
+  // 재생기는 화면 아래에 조작 막대 자리(약 81px)를 떼어 두고 남은 칸에만 영상을 그림
+  // → 막대를 투명하게 하면 그 자리와 좌우가 검게 녹화됨. 영상 칸을 화면 전체로 늘리고 막대는 그 위에 겹침
+  st.textContent = '#video-container { position: absolute !important; left: 0 !important; top: 0 !important;' +
+    ' width: 100% !important; height: 100% !important; }' +
+    ' #starplayer { width: 100% !important; height: 100% !important; }' +
+    ' #controller-container2 { z-index: 10 !important; }' +
+    ' #controller-container2, #controller-container2 *, [class*=tooltip]' +
     ' { opacity: 0 !important; transition: none !important; }' +
     ' html, body, body * { cursor: none !important; }';
   d.head.appendChild(st);
@@ -209,11 +216,13 @@ class AutoRecorder(threading.Thread):
            status(i, text), log(text), finished(summary)   (모두 이 스레드에서 호출 → 본체가 메인 스레드로 넘김)
     """
 
-    def __init__(self, lectures, hooks, gap=5):
+    def __init__(self, lectures, hooks, gap=5, tries=3):
         super().__init__(daemon=True)
         self.lectures = lectures
         self.h = hooks
         self.gap = gap
+        self.tries = max(1, tries)  # 도중에 끊긴 강의를 처음부터 다시 녹화하는 최대 횟수
+        self.result = ""
         self.stop_flag = threading.Event()
         self.recording = False
 
@@ -257,31 +266,21 @@ class AutoRecorder(threading.Thread):
 
     # -- 실행
     def run(self):
-        ok = fail = 0
+        ok = fail = skipped = 0
         try:
+            # self.lectures는 녹화 중에도 뒤에 강의가 더해질 수 있음 (표에서 '다시 녹화하기')
             for i, lec in enumerate(self.lectures):
                 if self.stop_flag.is_set():
                     break
-                self.h["status"](i, "준비 중")
-                try:
-                    self._one(i, lec)
+                if "skip" in self.h and self.h["skip"](i):  # 그 사이 표에서 지웠거나 완료로 바꿈
+                    skipped += 1
+                    continue
+                if not self._lecture(i, lec):
+                    break  # 사용자가 멈춤
+                if self.result == "완료":
                     ok += 1
-                    self.h["status"](i, "완료")
-                except Stopped:
-                    self.h["status"](i, "중지됨")
-                    break
-                except Exception as e:
+                else:
                     fail += 1
-                    self.h["status"](i, f"실패: {e}")
-                    self.h["log"](f"{lec['no']}강 실패: {e}")
-                finally:
-                    if self.recording:
-                        self.h["stop_rec"]()
-                        self.recording = False
-                    try:
-                        self._close_popups()
-                    except Exception:
-                        pass
                 if i + 1 < len(self.lectures) and not self.stop_flag.is_set():
                     try:
                         self._sleep(self.gap)
@@ -292,10 +291,46 @@ class AutoRecorder(threading.Thread):
                 time.sleep(0.5)
         finally:
             stopped = self.stop_flag.is_set()
-            left = len(self.lectures) - ok - fail
+            left = len(self.lectures) - ok - fail - skipped
             msg = f"자동 녹화 {'중지' if stopped else '끝'} - 완료 {ok}개" + (f", 실패 {fail}개" if fail else "") + \
                   (f", 남은 강의 {left}개" if stopped and left > 0 else "")
             self.h["finished"](msg)
+
+    def _lecture(self, i, lec):
+        """강의 하나 녹화. 도중에 끊기면 그 강의만 처음부터 다시 (최대 self.tries번)
+        → 사용자가 멈췄으면 False. 결과는 self.result ('완료' 또는 '실패: ...')"""
+        for attempt in range(1, self.tries + 1):
+            self.h["status"](i, "준비 중" if attempt == 1 else f"처음부터 다시 ({attempt}/{self.tries})")
+            try:
+                self._one(i, lec)
+                self.result = "완료"
+                self.h["status"](i, "완료")
+                return True
+            except Stopped:
+                self.h["status"](i, "중지됨 - 다음에 처음부터")
+                return False
+            except Exception as e:
+                err = e
+            finally:
+                if self.recording:
+                    self.h["stop_rec"]()
+                    self.recording = False
+                try:
+                    self._close_popups()
+                except Exception:
+                    pass
+            if attempt < self.tries:
+                self.h["log"](f"{lec['no']}강 중단 ({err}) → 처음부터 다시 녹화해요")
+                self.h["status"](i, f"중단됨: {err} - 다시 시도")
+                try:
+                    self._sleep(5)
+                except Stopped:
+                    self.h["status"](i, "중지됨 - 다음에 처음부터")
+                    return False
+        self.result = f"실패: {err}"
+        self.h["status"](i, self.result)
+        self.h["log"](f"{lec['no']}강 {self.tries}번 시도했지만 실패: {err}")
+        return True
 
     def _one(self, i, lec):
         st = lambda text: self.h["status"](i, text)  # noqa: E731
@@ -377,10 +412,12 @@ class AutoRecorder(threading.Thread):
         # 3. 전체화면 (진짜 마우스 클릭)
         st("전체화면 전환")
         ps.bring_to_front()
+        fs_at = None
         for _ in range(3):
             pos = ps.eval(FS_POS_JS)
             if pos:
                 ps.click(*pos)
+                fs_at = time.time()
             self._sleep(1.5)
             if self._state(ps).get("fs"):
                 break
@@ -389,6 +426,12 @@ class AutoRecorder(threading.Thread):
         ps.eval(PREPARE_JS)  # 전체화면 전환 중 재생이 시작됐으면 다시 맨 앞으로
         ps.eval(HIDE_UI_JS)  # 0:00부터 조작 막대가 안 보이게
         self._sleep(1)
+        # 전체화면이 되면 Edge가 위에 '전체 화면을 종료하려면 Esc 키를 누르세요' 알림을 몇 초 띄움
+        # → 알림이 사라진 뒤에 녹화 시작 (영상은 0:00에 멈춰 있으므로 빠지는 장면 없음)
+        if fs_at:
+            st("전체화면 알림이 사라지길 기다리는 중")
+            ps.eval(PREPARE_JS)
+            self._sleep(max(0.0, fs_at + FS_NOTICE_SECS - time.time()))
 
         # 4. 녹화 시작 → 재생
         st("녹화 시작")

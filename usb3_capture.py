@@ -23,6 +23,7 @@ import wave
 from datetime import datetime, timedelta
 from pathlib import Path
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import ttk, filedialog, messagebox
 
 import cv2
@@ -58,10 +59,12 @@ FPS_LIST = ["60", "30", "25", "24"]
 # ---------------------------------------------------------------- 설정
 DEFAULTS = {
     "video": "", "audio": "", "resolution": "1920x1080", "fps": "60",
-    "out_dir": str(Path.home() / "Videos" / "Captures"), "monitor": False,
+    "out_dir": str(Path.home() / "Videos" / "Captures"), "monitor": False, "monitor_out": "",
     "sched_mode": "range", "sched_start": "09:00:00", "sched_end": "10:00:00", "sched_minutes": "60",
     "sched_duration": "",  # 지금부터 녹화할 시간 "H:M:S" (비어 있으면 sched_minutes 사용 - 예전 설정 호환)
     "trim_after": True, "geometry": "", "zoomed": False, "tab": "0",
+    "mode": "auto",  # 시작 화면에서 마지막으로 고른 모드 (auto: 자동 녹화, direct: 직접 녹화)
+    "auto_geometry": "", "auto_zoomed": False,  # 자동 녹화 화면의 창 크기·위치 (직접 녹화와 따로 기억)
     # 용량 줄이기 (자르기 탭의 '용량 줄이기 설정으로 저장'도 이 설정을 씀)
     "auto_list": "", "auto_gap": "5",  # 자동 녹화: 강의 목록(줄바꿈은 \n으로 저장), 강의 사이 쉬는 시간
     # 자동 녹화 후 용량 줄이기: 사용 여부, 시점, 화질/해상도/프레임/GPU, 줄인 뒤 원본 삭제
@@ -161,6 +164,34 @@ def list_audio_devices():
         return []
 
 
+DEFAULT_OUT = "Windows 기본 출력 장치"
+
+
+def list_output_devices():
+    """'소리 듣기'에 쓸 출력 장치 [(sounddevice 인덱스 또는 None=Windows 기본, 이름)] - MME"""
+    out = [(None, DEFAULT_OUT)]
+    try:
+        apis = sd.query_hostapis()
+        mme = next((i for i, a in enumerate(apis) if a["name"] == "MME"), None)
+        for i, d in enumerate(sd.query_devices()):
+            if d["max_output_channels"] <= 0 or (mme is not None and d["hostapi"] != mme):
+                continue
+            if "사운드 매퍼" in d["name"] or "Sound Mapper" in d["name"]:
+                continue
+            out.append((i, d["name"]))
+    except Exception:
+        pass
+    return out
+
+
+def default_output_name():
+    """Windows 기본 출력 장치 이름 (모르면 '')"""
+    try:
+        return sd.query_devices(kind="output")["name"]
+    except Exception:
+        return ""
+
+
 def pick_by_keyword(names, saved, keywords=KEYWORDS):
     if saved and saved in names:
         return saved
@@ -232,7 +263,7 @@ NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 def media_info(path):
     """ffmpeg로 파일 정보 확인 → {ok: 열리는지, dur: 길이 초, fps, w, h} (모르면 None)"""
-    r = {"ok": False, "dur": None, "fps": None, "w": None, "h": None}
+    r = {"ok": False, "dur": None, "fps": None, "w": None, "h": None, "abr": None, "tag": False}
     try:
         p = subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-i", path],
                            capture_output=True, creationflags=NO_WINDOW, timeout=60)
@@ -249,7 +280,19 @@ def media_info(path):
     f = re.search(r"Stream #.*Video:.*?([\d.]+) fps", info)
     if f:
         r["fps"] = float(f.group(1))
+    a = re.search(r"Stream #.*Audio:.*?(\d+) kb/s", info)
+    if a:
+        r["abr"] = int(a.group(1))
+    r["tag"] = ENC_TAG in info
     return r
+
+
+ENC_TAG = "CaptureDeck encoded"  # 용량 줄이기로 만든 파일에 넣는 표시 (파일 정보의 comment)
+
+
+def is_encoded(info):
+    """용량 줄이기를 거친 파일인지: 표시가 있거나, 소리가 128k (녹화 파일은 192k)"""
+    return bool(info.get("tag") or (info.get("abr") and info["abr"] < 160))
 
 
 def probe_media(path):
@@ -281,6 +324,21 @@ def to_recycle_bin(path):
     return ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op)) == 0 and not os.path.exists(path)
 
 
+def suspend_process(proc, pause):
+    """실행 중인 프로세스를 잠시 멈추거나(pause=True) 다시 실행 (Windows만, 실패하면 False)"""
+    if sys.platform != "win32" or proc is None or proc.poll() is not None:
+        return False
+    import ctypes
+    k32, nt = ctypes.windll.kernel32, ctypes.windll.ntdll
+    h = k32.OpenProcess(0x0800, False, proc.pid)  # PROCESS_SUSPEND_RESUME
+    if not h:
+        return False
+    try:
+        return (nt.NtSuspendProcess(h) if pause else nt.NtResumeProcess(h)) == 0
+    finally:
+        k32.CloseHandle(h)
+
+
 def nvenc_available():
     """GPU 인코더(NVENC)를 쓸 수 있는지 (처음 한 번 확인하는 데 몇 초 걸릴 수 있음)"""
     video_encoder_args()
@@ -301,7 +359,7 @@ def compress_args(quality, res, fps, gpu, info):
     else:
         vargs = ["-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf)]
     return ((["-vf", ",".join(vf)] if vf else []) + vargs
-            + ["-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k"])
+            + ["-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-metadata", f"comment={ENC_TAG}"])
 
 
 def mux_to_mp4(vid, wav, out, progress=None):
@@ -497,6 +555,7 @@ class AudioWorker:
         self.wav = None
         self.lock = threading.Lock()
         self.monitor = False
+        self.out_device = None  # 소리 듣기 출력 장치 (None = Windows 기본)
         self.buf = bytearray()
         self.sr = 44100
         self.ch = 2
@@ -552,9 +611,11 @@ class AudioWorker:
         if on and self.out is None and self.running:
             try:
                 self.out = sd.OutputStream(
-                    samplerate=self.sr, channels=self.ch, dtype="int16",
+                    device=self.out_device, samplerate=self.sr, channels=self.ch, dtype="int16",
                     callback=self._out_cb)
                 self.out.start()
+                if self.error.startswith("모니터링"):
+                    self.error = ""
             except Exception as e:
                 self.error = f"모니터링 실패: {e}"
                 self.out = None
@@ -567,6 +628,13 @@ class AudioWorker:
             self.out = None
             with self.lock:
                 self.buf.clear()
+
+    def set_out_device(self, dev):
+        """소리 듣기 출력 장치 바꾸기 (듣는 중이면 새 장치로 다시 열기)"""
+        self.out_device = dev
+        if self.monitor:
+            self.set_monitor(False)
+            self.set_monitor(True)
 
     def start_rec(self, path):
         w = wave.open(path, "wb")
@@ -774,7 +842,7 @@ class TrimPanel(ttk.Frame):
 
         b = ttk.Frame(self)
         b.pack(fill="x", padx=8, pady=(4, 8))
-        self.btn_save = ttk.Button(b, text="잘라서 저장", command=self.save)
+        self.btn_save = ttk.Button(b, text="✂  잘라서 저장", style="Big.TButton", command=self.save)
         self.btn_save.pack(side="left")
         # 자르면서 '용량 줄이기' 탭의 설정(화질/해상도/프레임)으로 한 번에 인코딩
         self.var_compress = tk.BooleanVar(value=True)
@@ -1139,9 +1207,9 @@ class RecoverPanel(ttk.Frame):
 
         bot = ttk.Frame(self)
         bot.pack(fill="x", padx=8, pady=8)
-        self.btn_sel = ttk.Button(bot, text="선택 항목 복구", command=self.recover_selected)
+        self.btn_sel = ttk.Button(bot, text="선택 항목 복구", style="Big.TButton", command=self.recover_selected)
         self.btn_sel.pack(side="left")
-        self.btn_all = ttk.Button(bot, text="전체 복구", command=self.recover_all)
+        self.btn_all = ttk.Button(bot, text="전체 복구", style="Big.TButton", command=self.recover_all)
         self.btn_all.pack(side="left", padx=6)
         self.var_del = tk.BooleanVar(value=True)
         self.chk_del = ttk.Checkbutton(bot, text="복구에 성공하면 임시 파일(.tmp.mkv / .tmp.wav) 삭제",
@@ -1317,6 +1385,8 @@ class EncodePanel(ttk.Frame):
         self.removed = set()    # 인코딩 중 목록에서 뺀 항목 (건너뜀)
         self.auto_items = {}    # 자동 녹화에서 보낸 파일 → (설정, 끝나면 원본 삭제 여부)
         self.on_auto_done = None  # 자동 항목이 끝날 때마다 호출 (경로, 결과 문구)
+        self.on_auto_progress = None  # 자동 항목의 상태가 바뀔 때마다 호출 (경로, 상태 문구)
+        self.paused = threading.Event()  # 일시중지 중 (다음 파일도 시작하지 않음)
         self._build()
         threading.Thread(target=self._check_gpu, daemon=True).start()
 
@@ -1344,7 +1414,7 @@ class EncodePanel(ttk.Frame):
         self.tree.pack(side="left", fill="both", expand=True)
         sb.pack(side="left", fill="y")
 
-        o = ttk.LabelFrame(self, text="설정")
+        o = ttk.LabelFrame(self, text="설정", style="Section.TLabelframe", padding=(10, 4, 10, 8))
         o.pack(fill="x", padx=8, pady=8)
         ttk.Label(o, text="화질").grid(row=0, column=0, sticky="w", padx=(8, 4), pady=4)
         self.var_q = tk.StringVar(value=self.cfg.get("enc_quality") or ENC_QUALITY[1][0])
@@ -1377,7 +1447,7 @@ class EncodePanel(ttk.Frame):
 
         bot = ttk.Frame(self)
         bot.pack(fill="x", padx=8)
-        self.btn_start = ttk.Button(bot, text="용량 줄이기 시작", command=self.start)
+        self.btn_start = ttk.Button(bot, text="▶  용량 줄이기 시작", style="Big.TButton", command=self.start)
         self.btn_start.pack(side="left")
         self.btn_stop = ttk.Button(bot, text="중지", command=self.stop, state="disabled")
         self.btn_stop.pack(side="left", padx=6)
@@ -1395,6 +1465,8 @@ class EncodePanel(ttk.Frame):
     def _set(self, iid, col, text):
         if self.tree.exists(iid):
             self.tree.set(iid, col, text)
+        if col == "state" and iid in self.auto_items and self.on_auto_progress:
+            self.on_auto_progress(iid, text)
 
     def _check_gpu(self):
         ok = nvenc_available()
@@ -1507,6 +1579,8 @@ class EncodePanel(ttk.Frame):
         before = after = 0
         n = len(todo)
         for i, src in enumerate(todo):
+            while self.paused.is_set() and not self.stop_flag.is_set():
+                time.sleep(0.3)
             if self.stop_flag.is_set():
                 break
             if src in self.removed:
@@ -1609,9 +1683,24 @@ class EncodePanel(ttk.Frame):
         if self.on_auto_done:
             self.on_auto_done(src, state)
 
+    def pause(self, on):
+        """용량 줄이기 일시중지/다시 시작 (지금 인코딩 중인 ffmpeg도 멈춤)"""
+        if on:
+            self.paused.set()
+            suspend_process(self.proc, True)
+            if self.busy:
+                self._prev_status = self.lbl_status.cget("text")
+                self.lbl_status.config(text="일시중지 - 상태 체크가 끝나면 이어서 줄여요")
+        else:
+            suspend_process(self.proc, False)
+            self.paused.clear()
+            if self.busy and getattr(self, "_prev_status", None):
+                self.lbl_status.config(text=self._prev_status)
+
     def stop(self):
         if not self.busy:
             return
+        self.pause(False)
         self.stop_flag.set()
         p = self.proc
         if p is not None:
@@ -1634,122 +1723,238 @@ class EncodePanel(ttk.Frame):
 
 
 # ---------------------------------------------------------------- 메인 앱
-class AutoPanel(ttk.Frame):
-    """온라인 강의 연속 자동 녹화: 강의 제목 목록 → 차례로 강의 창 열기 · 전체화면 · 녹화 · 저장"""
+def enc_state(text):
+    """용량 줄이기 진행 문구 → 강의 표의 상태 (인코딩 대기 / 인코딩 중 35% / 인코딩 완료 / 인코딩 실패: ...)"""
+    if text.startswith("인코딩"):
+        return text
+    if text.startswith("완료"):
+        return "인코딩 완료"
+    return "인코딩 " + text
 
-    COLS = (("no", "일련번호", 70), ("title", "강의 제목", 380), ("len", "길이", 100), ("state", "상태", 260))
+
+class TreeTip:
+    """표 칸에 마우스를 올리면 그 칸의 글자 전체를 툴팁으로 보여줌 (잘려 보이는 긴 상태·제목용)"""
+
+    def __init__(self, tree, cols):
+        self.tree, self.cols = tree, cols
+        self.tip = None
+        self.cell = None
+        self.job = None
+        tree.bind("<Motion>", self._move, add="+")
+        tree.bind("<Leave>", lambda e: self._hide(), add="+")
+        tree.bind("<ButtonPress>", lambda e: self._hide(), add="+")
+
+    def _move(self, ev):
+        row, col = self.tree.identify_row(ev.y), self.tree.identify_column(ev.x)
+        cell = (row, col)
+        if cell == self.cell:
+            return
+        self._hide()
+        self.cell = cell
+        if not row or not col:
+            return
+        key = self.tree["columns"][int(col[1:]) - 1]
+        if key in self.cols:
+            text = str(self.tree.set(row, key))
+            if text:
+                self.job = self.tree.after(350, self._show, text, ev.x_root, ev.y_root)
+
+    def _show(self, text, x, y):
+        self.job = None
+        self.tip = t = tk.Toplevel(self.tree)
+        t.wm_overrideredirect(True)
+        t.attributes("-topmost", True)
+        tk.Label(t, text=text, background="#ffffe1", foreground="#222", relief="solid", borderwidth=1,
+                 padx=6, pady=3, justify="left", wraplength=520).pack()
+        t.update_idletasks()
+        x = min(x + 12, t.winfo_screenwidth() - t.winfo_reqwidth() - 4)
+        t.geometry(f"+{max(0, x)}+{y + 18}")
+
+    def _hide(self):
+        if self.job:
+            self.tree.after_cancel(self.job)
+            self.job = None
+        if self.tip:
+            self.tip.destroy()
+            self.tip = None
+        self.cell = None
+
+
+class NoAuto:
+    """직접 녹화 모드: 자동 녹화가 없음 (App이 자동 녹화 상태를 물어볼 때 쓰는 빈 객체)"""
+    running = False
+    stopped = False
+
+    def save(self):
+        pass
+
+    def on_saved(self, path):
+        pass
+
+    def stop(self):
+        pass
+
+    def _encoded(self, src, state):
+        pass
+
+
+class AutoPanel(ttk.Frame):
+    """온라인 강의 연속 자동 녹화 화면: 위 안내 줄 / 왼쪽 미리보기·장치·용량 줄이기·시작 / 오른쪽 강의 표"""
+
+    COLS = (("no", "일련번호", 64), ("title", "강의 제목", 230), ("len", "길이", 84), ("state", "상태", 150))
+    ENC_WHEN = ("모든 강의 녹화가 끝난 뒤", "강의마다 저장되면 바로")
 
     def __init__(self, master, app):
         super().__init__(master)
         self.app = app
         self.runner = None
-        self.items = []  # 녹화할 강의 [{idx, no, title, mins}]
+        self.rows = {}       # 표 행 → 강의 {idx, no, title, mins}
+        self.run_rows = []   # 이번 실행에서 녹화할 표 행 (AutoRecorder 순번 → 행)
+        self.saved = []      # 이번 자동 녹화에서 저장된 파일 (끝난 뒤 한꺼번에 줄일 때)
+        self.muxed = set()      # MP4 변환이 끝난 파일
+        self.completed = set()  # 끝까지 녹화를 마친 표 행 (이 둘이 맞아야 용량 줄이기로 보냄)
+        self.rec_files = {}  # 표 행 → 그 강의를 녹화한 MP4 경로
+        self.cur_row = None  # 지금 진행 중인 표 행
+        self.stopped = False  # 사용자가 '중지'를 눌렀는지 (그러면 컴퓨터를 끄지 않음)
         self._build()
+        self._load_rows()
+        self.after(1500, self._startup_check)
 
     @property
     def running(self):
         return self.runner is not None
 
     def _build(self):
-        top = ttk.Frame(self)
-        top.pack(fill="x", padx=8, pady=(8, 4))
-        self.btn_edge = ttk.Button(top, text="1. 자동녹화용 Edge 열기", command=self.app.open_edge)
+        # 위: 순서 안내
+        top = ttk.Frame(self, padding=(10, 10, 10, 0))
+        top.pack(fill="x")
+        self.btn_edge = ttk.Button(top, text="① 자동녹화용 Edge 열기", command=self.app.open_edge)
         self.btn_edge.pack(side="left")
-        ttk.Label(top, text="→ 2. 그 Edge에서 로그인 · 나의 강의실 · 강좌를 눌러 강의 목록을 펼침"
-                            "  → 3. 녹화할 강의를 아래에 입력  → 4. 자동 녹화 시작",
-                  foreground="#555").pack(side="left", padx=8)
+        for text in ("②  그 Edge에서 로그인 › 나의 강의실 › 강좌를 눌러 강의 목록 펼치기",
+                     "③  LESSON 추가", "④  자동 녹화 시작"):
+            ttk.Label(top, text="→", style="Hint.TLabel").pack(side="left", padx=8)
+            ttk.Label(top, text=text).pack(side="left")
+
+        # 맨 아래: 상태 줄 (왼쪽 자동 녹화 진행, 오른쪽 녹화 시간·장치 상태는 App이 채움)
+        self.statusbar = ttk.Frame(self, padding=(10, 4, 10, 6))
+        self.statusbar.pack(side="bottom", fill="x")
+        ttk.Separator(self).pack(side="bottom", fill="x")
+        self.lbl = ttk.Label(self.statusbar, text="")
+        self.lbl.pack(side="left")
 
         body = ttk.Frame(self)
-        body.pack(fill="both", expand=True, padx=8)
-        left = ttk.Frame(body)
-        left.pack(side="left", fill="y")
-        ttk.Label(left, text="녹화할 LESSON\n예: 제 1 강 / 제 1 강 ~ 제 3 강 / 1~3 / 1, 2, 3").pack(anchor="w")
-        self.txt = tk.Text(left, width=38, height=18, undo=True, wrap="none")
-        self.txt.pack(fill="both", expand=True, pady=4)
-        self.txt.insert("1.0", self.app.cfg.get("auto_list", "").replace("\\n", "\n"))
-        lb = ttk.Frame(left)
-        lb.pack(fill="x")
-        self.btn_check = ttk.Button(lb, text="목록 확인 →", command=self.check)
-        self.btn_check.pack(side="right")
-
+        body.pack(fill="both", expand=True)
+        # 오른쪽: 녹화할 강의 표 + 실행
         right = ttk.Frame(body)
-        right.pack(side="left", fill="both", expand=True, padx=(8, 0))
-        self.tree = ttk.Treeview(right, columns=[c[0] for c in self.COLS], show="headings", selectmode="none")
+        right.pack(side="right", fill="y", padx=(0, 10), pady=10)
+        lf = ttk.LabelFrame(right, text="녹화할 강의", style="Section.TLabelframe", padding=(8, 6, 8, 8))
+        lf.pack(fill="both", expand=True)
+        tf = ttk.Frame(lf)
+        tf.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(tf, columns=[c[0] for c in self.COLS], show="headings", selectmode="extended")
         for key, text, w in self.COLS:
             self.tree.heading(key, text=text)
             self.tree.column(key, width=w, anchor="w" if key in ("title", "state") else "center",
                              stretch=key in ("title", "state"))
-        sb = ttk.Scrollbar(right, orient="vertical", command=self.tree.yview)
+        sb = ttk.Scrollbar(tf, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
-        self.tree.pack(side="left", fill="both", expand=True, pady=(20, 0))
-        sb.pack(side="left", fill="y", pady=(20, 0))
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="left", fill="y")
+        self.tree.bind("<Delete>", lambda e: self.remove_selected())
+        self.tree.bind("<Button-3>", self._popup)
+        TreeTip(self.tree, ("title", "state"))  # 잘려 보이는 상태·제목 전체를 툴팁으로
+        rb = ttk.Frame(lf)
+        rb.pack(fill="x", pady=(8, 0))
+        self.btn_add = ttk.Button(rb, text="+ LESSON 추가", command=self.add_dialog)
+        self.btn_add.pack(side="left")
+        self.menu = tk.Menu(self, tearoff=0)
+        self.menu.add_command(label="다시 녹화하기 (대기로)", command=lambda: self.set_state("대기 (다시 녹화)"))
+        self.menu.add_command(label="완료로 표시 (녹화 안 함)", command=lambda: self.set_state("완료 (직접 표시)"))
+        self.menu.add_command(label="인코딩 대기 (용량 줄이기)", command=self.encode_selected)
+        self.menu.add_separator()
+        self.menu.add_command(label="녹화 파일 열기", command=lambda: self.open_file(False))
+        self.menu.add_command(label="폴더에서 보기", command=lambda: self.open_file(True))
+        self.menu.add_separator()
+        self.menu.add_command(label="표에서 삭제", command=self.remove_selected)
+        self.btn_state = ttk.Menubutton(rb, text="상태 변경", menu=self.menu)
+        self.btn_state.pack(side="left", padx=(6, 0))
+        self.btn_check = ttk.Button(rb, text="상태 체크", command=self.check_files)
+        self.btn_check.pack(side="left", padx=(6, 0))
+        self.btn_del = ttk.Button(rb, text="선택 삭제", command=self.remove_selected)
+        self.btn_del.pack(side="left", padx=(6, 0))
+        self.btn_clear = ttk.Button(rb, text="모두 지우기", command=self.clear_rows)
+        self.btn_clear.pack(side="left", padx=(6, 0))
+        self.lbl_total = ttk.Label(rb, text="", style="Hint.TLabel")
+        self.lbl_total.pack(side="right")
 
-        self._build_encode()
-
-        bot = ttk.Frame(self)
-        bot.pack(fill="x", padx=8, pady=8)
-        self.btn_start = ttk.Button(bot, text="▶ 자동 녹화 시작", command=self.start)
+        run = ttk.LabelFrame(right, text="자동 녹화", style="Section.TLabelframe", padding=(8, 6, 8, 8))
+        run.pack(fill="x", pady=(10, 0))
+        self.btn_start = ttk.Button(run, text="▶  자동 녹화 시작", style="Big.TButton", command=self.start)
         self.btn_start.pack(side="left")
-        self.btn_stop = ttk.Button(bot, text="■ 중지", command=self.stop, state="disabled")
-        self.btn_stop.pack(side="left", padx=6)
-        ttk.Label(bot, text="강의 사이 쉬는 시간").pack(side="left", padx=(16, 4))
+        self.btn_stop = ttk.Button(run, text="■  중지", style="Big.TButton", command=self.stop, state="disabled")
+        self.btn_stop.pack(side="left", padx=(6, 0))
+        ttk.Label(run, text="초").pack(side="right")
         self.var_gap = tk.StringVar(value=str(self.app.cfg.get("auto_gap", "5")))
-        ttk.Spinbox(bot, from_=0, to=600, textvariable=self.var_gap, width=5).pack(side="left")
-        ttk.Label(bot, text="초").pack(side="left", padx=(2, 0))
-        self.lbl = ttk.Label(bot, text="")
-        self.lbl.pack(side="left", padx=16)
+        ttk.Spinbox(run, from_=0, to=600, textvariable=self.var_gap, width=4, justify="center"
+                    ).pack(side="right", padx=4)
+        ttk.Label(run, text="강의 사이 쉬는 시간").pack(side="right")
+        # 매번 꺼진 상태로 시작 (켜 둔 채 잊고 다음에 쓰다가 컴퓨터가 꺼지지 않도록 저장하지 않음)
+        self.var_shutdown = tk.BooleanVar(value=False)
+        ttk.Checkbutton(run, text="작업 완료 후 컴퓨터 종료", variable=self.var_shutdown
+                        ).pack(side="bottom", anchor="w", pady=(8, 0), before=self.btn_start)
 
-    ENC_WHEN = ("모든 강의 녹화가 끝난 뒤", "강의마다 저장되면 바로")
+        # 왼쪽: 미리보기와 설정 탭은 App이 채움 (설정 탭 중 '용량 줄이기'는 build_encode)
+        self.left = ttk.Frame(body)
+        self.left.pack(side="left", fill="both", expand=True)
 
-    def _build_encode(self):
+    def build_encode(self, parent):
         """녹화 후 용량 줄이기 설정 ('용량 줄이기' 탭과 같은 방식으로 다시 인코딩)"""
         cfg = self.app.cfg
-        o = ttk.LabelFrame(self, text="녹화 후 용량 줄이기")
-        o.pack(fill="x", padx=8, pady=(8, 0))
+        o = ttk.LabelFrame(parent, text="녹화 후 용량 줄이기", style="Section.TLabelframe", padding=(10, 4, 10, 8))
+        o.pack(fill="x", pady=(8, 0))
+        r0 = ttk.Frame(o)
+        r0.pack(fill="x", pady=2)
         self.var_enc = tk.BooleanVar(value=bool(cfg.get("auto_enc")))
-        ttk.Checkbutton(o, text="자동으로 용량 줄이기", variable=self.var_enc,
-                        command=self._enc_state).grid(row=0, column=0, sticky="w", padx=8, pady=4)
-        ttk.Label(o, text="시점").grid(row=0, column=1, sticky="e", padx=(16, 4))
-        self.cb_when = ttk.Combobox(o, values=self.ENC_WHEN, state="readonly", width=24)
+        ttk.Checkbutton(r0, text="녹화한 영상을 자동으로 줄이기", variable=self.var_enc,
+                        command=self._enc_state).pack(side="left")
+        self.cb_when = ttk.Combobox(r0, values=self.ENC_WHEN, state="readonly", width=24)
         self.cb_when.set(cfg.get("auto_enc_when") if cfg.get("auto_enc_when") in self.ENC_WHEN else self.ENC_WHEN[0])
-        self.cb_when.grid(row=0, column=2, columnspan=3, sticky="w")
-        ttk.Label(o, foreground="#555", text="'바로'는 녹화와 인코딩이 겹쳐요 (CPU 인코딩이면 녹화가 끊길 수 있어요)"
-                  ).grid(row=0, column=5, columnspan=4, sticky="w", padx=(12, 8))
+        self.cb_when.pack(side="left", padx=(16, 0))
+        ttk.Label(r0, text="'바로'는 녹화 중에 인코딩해요 (CPU면 녹화가 끊길 수 있어요)",
+                  style="Hint.TLabel").pack(side="left", padx=(10, 0))
 
-        ttk.Label(o, text="화질").grid(row=1, column=0, sticky="e", padx=(8, 4), pady=4)
+        r1 = ttk.Frame(o)
+        r1.pack(fill="x", pady=2)
+        ttk.Label(r1, text="화질").pack(side="left", padx=(22, 6))
         self.var_eq = tk.StringVar(value=cfg.get("auto_enc_quality"))
         if self.var_eq.get() not in dict(ENC_QUALITY):
             self.var_eq.set(ENC_QUALITY[1][0])
-        qf = ttk.Frame(o)
-        qf.grid(row=1, column=1, columnspan=2, sticky="w")
         self.enc_widgets = [self.cb_when]
         for name, _ in ENC_QUALITY:
-            rb = ttk.Radiobutton(qf, text=name, value=name, variable=self.var_eq)
+            rb = ttk.Radiobutton(r1, text=name, value=name, variable=self.var_eq)
             rb.pack(side="left", padx=(0, 10))
             self.enc_widgets.append(rb)
-        ttk.Label(o, text="해상도").grid(row=1, column=3, sticky="e", padx=(12, 4))
-        self.cb_eres = ttk.Combobox(o, values=ENC_RES, state="readonly", width=7)
+        ttk.Label(r1, text="해상도").pack(side="left", padx=(10, 4))
+        self.cb_eres = ttk.Combobox(r1, values=ENC_RES, state="readonly", width=7)
         self.cb_eres.set(cfg.get("auto_enc_res") if cfg.get("auto_enc_res") in ENC_RES else "원본")
-        self.cb_eres.grid(row=1, column=4, sticky="w")
-        ttk.Label(o, text="프레임").grid(row=1, column=5, sticky="e", padx=(12, 4))
-        self.cb_efps = ttk.Combobox(o, values=ENC_FPS, state="readonly", width=7)
+        self.cb_eres.pack(side="left")
+        ttk.Label(r1, text="프레임").pack(side="left", padx=(12, 4))
+        self.cb_efps = ttk.Combobox(r1, values=ENC_FPS, state="readonly", width=7)
         self.cb_efps.set(cfg.get("auto_enc_fps") if cfg.get("auto_enc_fps") in ENC_FPS else "30fps")
-        self.cb_efps.grid(row=1, column=6, sticky="w")
+        self.cb_efps.pack(side="left")
         self.var_egpu = tk.BooleanVar(value=bool(cfg.get("auto_enc_gpu")))
-        chk_gpu = ttk.Checkbutton(o, text="GPU로 빠르게 (NVIDIA)", variable=self.var_egpu)
-        chk_gpu.grid(row=1, column=7, sticky="w", padx=(12, 8))
+        chk_gpu = ttk.Checkbutton(r1, text="GPU로 빠르게 (NVIDIA)", variable=self.var_egpu)
+        chk_gpu.pack(side="left", padx=(14, 0))
+
         self.var_edel = tk.BooleanVar(value=bool(cfg.get("auto_enc_delete")))
-        chk_del = ttk.Checkbutton(o, text="줄인 뒤 원본 삭제 (휴지통으로 · 줄인 파일이 원본 이름 '제 1 강.mp4'를 이어받음)",
+        chk_del = ttk.Checkbutton(o, text="줄인 뒤 원본은 휴지통으로  (줄인 파일이 '제 1 강.mp4' 이름을 이어받아요)",
                                   variable=self.var_edel)
-        chk_del.grid(row=2, column=0, columnspan=8, sticky="w", padx=8, pady=(0, 6))
+        chk_del.pack(anchor="w", padx=(22, 0), pady=2)
         self.enc_widgets += [self.cb_eres, self.cb_efps, chk_gpu, chk_del]
-        self.saved = []      # 이번 자동 녹화에서 저장된 파일 (끝난 뒤 한꺼번에 줄일 때)
-        self.rec_files = {}  # 표 행 → 그 강의를 녹화한 MP4 경로
-        self.cur_row = None  # 지금 진행 중인 표 행
         self._enc_state()
 
     def _enc_state(self):
-        on = self.var_enc.get()
+        on = self.var_enc.get() and not self.running
         for w in self.enc_widgets:
             w.config(state=("readonly" if isinstance(w, ttk.Combobox) else "normal") if on else "disabled")
 
@@ -1759,28 +1964,63 @@ class AutoPanel(ttk.Frame):
         return self.var_eq.get(), self.cb_eres.get(), self.cb_efps.get(), gpu
 
     def on_saved(self, path):
-        """자동 녹화 강의 하나가 MP4로 저장됨"""
+        """자동 녹화 강의 하나가 MP4로 저장됨 (끝까지 녹화했는지는 아직 모름)"""
+        self.muxed.add(os.path.normcase(os.path.normpath(path)))
+        self._dispatch()
+
+    def _dispatch(self):
+        """끝까지 녹화를 마친('완료') 강의의 파일만 용량 줄이기로 보냄
+        (중지·종료·오류로 중간에 끊긴 파일은 줄이지 않음 → 상태도 '용량 줄이기 완료'가 되지 않음)"""
+        for iid in list(self.completed):
+            p = self.rec_files.get(iid)
+            key = os.path.normcase(os.path.normpath(p)) if p else None
+            if key not in self.muxed:
+                continue  # 아직 MP4 변환 중
+            self.completed.discard(iid)
+            self.muxed.discard(key)
+            self._verify_then(iid, p, lambda p=p: self._after_verified(p))
+
+    def _after_verified(self, p):
+        """끝까지 정상으로 녹화된 파일 → (설정에 따라) 용량 줄이기"""
         if not self.var_enc.get():
             return
-        if self.cb_when.get() == self.ENC_WHEN[1]:
-            self._send_encode([path])
+        if self.cb_when.get() == self.ENC_WHEN[1] or not self.running:
+            self._send_encode([p])
         else:
-            self.saved.append(path)
+            self.saved.append(p)
 
     def _send_encode(self, paths):
         self.app.encode.enqueue(paths, self.enc_options(), bool(self.var_edel.get()))
+        for iid, p in self.rec_files.items():
+            if p in paths and self.tree.exists(iid):
+                self.tree.set(iid, "state", "인코딩 대기")
 
     def _encoded(self, src, state):
         """용량 줄이기가 끝난 자동 녹화 파일 → 표에 표시"""
         for iid, path in self.rec_files.items():
             if os.path.normcase(path) == os.path.normcase(src) and self.tree.exists(iid):
-                self.tree.set(iid, "state", "용량 줄이기 " + state)
+                self.tree.set(iid, "state", enc_state(state))
+                if state.startswith("완료"):  # 줄인 파일도 길이·용량 확인
+                    self._verify_then(iid, path, lambda: None)
+        self._save_rows()
+
+    def encode_progress(self, src, text):
+        """용량 줄이기 진행 상황 (예: 줄이는 중 35%) → 표에 표시"""
+        for iid, path in self.rec_files.items():
+            if os.path.normcase(path) == os.path.normcase(src) and self.tree.exists(iid):
+                self.tree.set(iid, "state", enc_state(text))
 
     def _start_rec(self, name):
-        """녹화 시작 (메인 스레드) + 이 행의 저장 파일 경로 기억"""
+        """녹화 시작 (메인 스레드) + 이 행의 저장 파일 경로 기억
+        이 강의를 전에 녹화하다 끊긴 파일이 있으면 휴지통으로 보내고 처음부터 다시 녹화"""
+        old = self.rec_files.get(self.cur_row)
+        if old and os.path.isfile(old) and not self._done(self.tree.set(self.cur_row, "state")):
+            if to_recycle_bin(old):
+                self.lbl.config(text=f"끊긴 녹화 파일은 휴지통으로 보냈어요: {os.path.basename(old)}")
         ok = self.app.start_recording(True, name)
         if ok and self.cur_row is not None:
             self.rec_files[self.cur_row] = os.path.normpath(self.app.rec_base + ".mp4")
+            self._persist()  # 갑자기 꺼져도 다음에 이 파일을 끊긴 파일로 알아보도록
         return ok
 
     # -- 메인 스레드로 넘기기
@@ -1803,85 +2043,536 @@ class AutoPanel(ttk.Frame):
         ev.wait(30)
         return box[0] if box else None
 
+    # -- 강의 표 (설정 파일에 저장해 두고 다음 실행 때 다시 보여줌)
+    @staticmethod
+    def _done(state):
+        return state.startswith(("완료", "인코딩"))  # 인코딩 중·완료·실패도 녹화는 끝난 것
+
+    def _startup_check(self):
+        """다 녹화했다고 되어 있는 강의가 정말 끝까지 녹화됐는지 (예: 중간에 끊긴 파일이 완료로 남은 경우)"""
+        done = [i for i in self.tree.get_children()
+                if self._done(self.tree.set(i, "state")) and "직접 표시" not in self.tree.set(i, "state")]
+        if done and not self.running:
+            self.check_files(done, "녹화한 강의 확인")
+
+    def _load_rows(self):
+        try:
+            rows = json.loads(self.app.cfg.get("auto_list") or "[]")
+        except ValueError:
+            rows = []  # 예전 형식(입력한 글자 그대로)은 버림
+        for r in rows if isinstance(rows, list) else []:
+            if isinstance(r, dict) and "no" in r:
+                state = r.get("state", "대기")
+                if state.startswith("용량 줄이기 "):  # 예전 이름 → 새 이름
+                    state = enc_state(state[len("용량 줄이기 "):])
+                iid = self._insert(r, state if self._done(state) else "대기", r.get("len", ""))
+                if r.get("file"):
+                    self.rec_files[iid] = r["file"]
+        self._update_total()
+
+    def _save_rows(self):
+        rows = []
+        for iid in self.tree.get_children():
+            lec = dict(self.rows[iid])
+            lec["state"] = self.tree.set(iid, "state")
+            lec["len"] = self.tree.set(iid, "len")
+            if self.rec_files.get(iid):
+                lec["file"] = self.rec_files[iid]
+            rows.append(lec)
+        self.app.cfg["auto_list"] = json.dumps(rows, ensure_ascii=False)
+
+    def _persist(self):
+        """표를 설정 파일에 바로 저장 (프로그램이 갑자기 꺼져도 다음에 그대로 복원)"""
+        self._save_rows()
+        try:
+            save_config(self.app.cfg)
+        except OSError:
+            pass
+
+    def _insert(self, lec, state="대기", length=None):
+        if length is None:
+            length = f"{lec['mins']}분" if lec.get("mins") is not None else ""
+        # 항상 일련번호 오름차순 (들어갈 자리를 찾아 끼워 넣음)
+        kids = self.tree.get_children()
+        pos = next((k for k, i in enumerate(kids) if self.rows[i]["no"] > lec["no"]), "end")
+        iid = self.tree.insert("", pos, values=(lec["no"], lec.get("title", ""), length, state))
+        self.rows[iid] = {k: lec.get(k) for k in ("idx", "no", "title", "mins")}
+        return iid
+
+    def _update_total(self):
+        todo = [iid for iid in self.tree.get_children() if not self._done(self.tree.set(iid, "state"))]
+        total = sum(self.rows[i].get("mins") or 0 for i in todo)
+        self.lbl_total.config(text=f"녹화할 강의 {len(todo)}개 · 약 {total // 60}시간 {total % 60}분" if todo else "")
+
+    def remove_selected(self):
+        for iid in self.tree.selection():
+            if self.running and iid == self.cur_row:
+                self.lbl.config(text="지금 녹화 중인 강의는 지울 수 없어요.")
+                continue
+            self.tree.delete(iid)
+            self.rows.pop(iid, None)
+            self.rec_files.pop(iid, None)
+        self._update_total()
+        self._persist()
+
+    def _popup(self, ev):
+        """표 오른쪽 클릭 → 상태 변경 메뉴 (누른 행이 선택에 없으면 그 행만 선택)"""
+        iid = self.tree.identify_row(ev.y)
+        if not iid:
+            return
+        if iid not in self.tree.selection():
+            self.tree.selection_set(iid)
+        self.menu.tk_popup(ev.x_root, ev.y_root)
+
+    def set_state(self, state):
+        """선택한 강의의 상태를 직접 바꿈 (예: 녹화 파일이 이상해서 지웠으면 '다시 녹화하기')
+        자동 녹화 중이면 지금 강의가 끝난 뒤 이어서 녹화"""
+        sel = list(self.tree.selection())
+        if not sel:
+            self.lbl.config(text="표에서 강의를 먼저 선택해 주세요.")
+            return
+        redo = not self._done(state)
+        n = 0
+        for iid in sel:
+            if self.running and iid == self.cur_row:
+                continue  # 지금 녹화 중인 강의는 그대로
+            self.tree.set(iid, "state", state)
+            n += 1
+            if redo:
+                self._requeue(iid)
+        self._update_total()
+        self._persist()
+        if n:
+            what = "다시 녹화" if redo else "완료로 표시"
+            self.lbl.config(text=f"{n}개를 {what}했어요."
+                                 + (" 지금 녹화가 끝나면 이어서 녹화해요." if redo and self.running else
+                                    " '자동 녹화 시작'을 누르면 녹화해요." if redo else ""))
+
+    def _rec_path(self, iid):
+        return self.rec_files.get(iid) or os.path.join(self.app.var_dir.get(), f"제 {self.rows[iid]['no']} 강.mp4")
+
+    def _unencoded(self):
+        """녹화만 끝나고 아직 인코딩 안 한 강의 ('완료' 상태, 직접 표시는 제외)"""
+        return [i for i in self.tree.get_children()
+                if self.tree.set(i, "state").startswith("완료") and "직접 표시" not in self.tree.set(i, "state")]
+
+    def encode_selected(self):
+        """상태 변경 → 인코딩 대기: 선택한 강의의 녹화 파일을 용량 줄이기로 보냄"""
+        sel = [i for i in self.tree.selection() if not self._busy_encoding(self.tree.set(i, "state"))]
+        if not sel:
+            self.lbl.config(text="표에서 강의를 먼저 선택해 주세요." if not self.tree.selection()
+                            else "이미 인코딩 대기·인코딩 중인 강의예요.")
+            return
+        self.encode_rows(sel, force=True)
+
+    def encode_rows(self, iids, note="", later=False, force=False):
+        """녹화 파일을 확인한 뒤 용량 줄이기로 보냄
+        - 덜 녹화됐거나 깨진 파일은 다시 녹화로
+        - 이미 줄인 파일은 '인코딩 완료'로 (force: 직접 고른 경우엔 그래도 다시 줄임)
+        - later: 자동 녹화가 모두 끝난 뒤에 줄임"""
+        jobs = [(iid, self._rec_path(iid), *self._row_expect(iid)) for iid in iids
+                if self.tree.exists(iid) and not (self.running and iid == self.cur_row)]
+        if not jobs:
+            return
+
+        def work():
+            import glob
+            res = []
+            for iid, path, exp, tol in jobs:
+                if not os.path.isfile(path):
+                    res.append((iid, path, "파일 없음", False))
+                    continue
+                info = media_info(path)
+                small = [x for x in glob.glob(glob.escape(os.path.splitext(path)[0]) + "_small*.mp4")
+                         if not x.endswith(".part.mp4")]
+                res.append((iid, path, self._judge(path, info, exp, tol), is_encoded(info) or bool(small)))
+            self._ui(done, res)
+
+        def done(res):
+            send, bad, already, missing = [], 0, 0, 0
+            for iid, path, problem, enc in res:
+                if not self.tree.exists(iid) or (self.running and iid == self.cur_row):
+                    continue
+                state = self.tree.set(iid, "state")
+                if problem == "파일 없음" and not self._done(state):
+                    missing += 1  # 아직 녹화 안 한 강의
+                    continue
+                if problem:
+                    bad += 1
+                    self._mark_bad(iid, None if problem == "파일 없음" else path, problem)
+                    continue
+                self.rec_files[iid] = os.path.normpath(path)
+                if enc and not force:
+                    already += 1
+                    self.tree.set(iid, "state", "인코딩 완료")
+                    continue
+                send.append(self.rec_files[iid])
+            if send and later and self.running:
+                self.saved.extend(send)
+                for iid, p in self.rec_files.items():
+                    if p in send and self.tree.exists(iid):
+                        self.tree.set(iid, "state", "인코딩 대기 (녹화가 모두 끝나면)")
+            elif send:
+                self._send_encode(send)
+            self._update_total()
+            self._persist()
+            parts = [note] if note else []
+            if send:
+                parts.append(f"녹화만 된 강의 {len(send)}개 인코딩 대기"
+                             + (" (녹화가 모두 끝나면 시작)" if later and self.running else ""))
+            if already:
+                parts.append(f"이미 인코딩된 강의 {already}개")
+            if bad:
+                parts.append(f"파일이 이상한 강의 {bad}개는 다시 녹화")
+            if missing:
+                parts.append(f"녹화 파일이 없는 강의 {missing}개는 건너뜀")
+            if parts:
+                self.lbl.config(text="  ·  ".join(parts))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _requeue(self, iid):
+        """자동 녹화 중이면 이 강의를 지금 하는 것들이 끝난 뒤 이어서 녹화"""
+        if self.running and iid != self.cur_row and iid not in self._pending():
+            self.runner.lectures.append(dict(self.rows[iid]))
+            self.run_rows.append(iid)
+
+    @staticmethod
+    def _expected(length, lec):
+        """표의 '길이'로 기대하는 영상 길이(초)와 허용 오차 → (초, 오차) 또는 (None, 0)"""
+        m = re.fullmatch(r"(\d+)분 ([\d.]+)초", length or "")
+        if m:  # 녹화할 때 확인한 실제 영상 길이 (정확)
+            return int(m.group(1)) * 60 + float(m.group(2)), 3.0
+        m = re.fullmatch(r"(\d+)분", length or "")
+        mins = int(m.group(1)) if m else lec.get("mins")
+        if mins:  # 강의 목록의 '분' (반올림돼 있을 수 있음)
+            return mins * 60, 60.0
+        return None, 0
+
+    MIN_SECS = 300      # 기대 길이를 모를 때: 이보다 짧으면 비정상 (5분)
+    MIN_KBPS = 100      # 이보다 용량이 작으면 (거의 빈 화면) 비정상 (정상 강의 파일은 300~1000kbps)
+
+    @classmethod
+    def _judge(cls, path, info, exp, tol):
+        """녹화 파일이 정상인지 → None(정상) 또는 문제 문구 (다른 스레드에서 호출해도 됨)"""
+        if not info["ok"]:
+            return "파일 깨짐"
+        dur = info["dur"] or 0
+        if exp and dur < exp - tol:
+            return f"덜 녹화됨 {fmt_secs(dur)} / {fmt_secs(exp)}"
+        if not exp and dur < cls.MIN_SECS:
+            return f"너무 짧음 {fmt_secs(dur)}"
+        try:
+            kbps = os.path.getsize(path) * 8 / 1000 / max(dur, 1)
+        except OSError:
+            return "파일 없음"
+        if kbps < cls.MIN_KBPS:
+            return f"용량 비정상 {os.path.getsize(path) / 1e6:.1f}MB"
+        return None
+
+    def _row_expect(self, iid):
+        return self._expected(self.tree.set(iid, "len"), self.rows[iid])
+
+    def _mark_bad(self, iid, path, problem):
+        """비정상 파일 → '... - 다시 녹화' (자동 녹화 중이면 이어서 녹화, 다시 녹화하면 그 파일은 휴지통으로)"""
+        if path:
+            self.rec_files[iid] = os.path.normpath(path)
+        self.tree.set(iid, "state", f"{problem} - 다시 녹화")
+        self._requeue(iid)
+
+    def _verify_then(self, iid, path, then):
+        """방금 만든 파일을 확인 → 정상이면 then(), 아니면 다시 녹화"""
+        exp, tol = self._row_expect(iid)
+
+        def work():
+            problem = self._judge(path, media_info(path), exp, tol) if os.path.isfile(path) else "파일 없음"
+            self._ui(done, problem)
+
+        def done(problem):
+            if not self.tree.exists(iid):
+                return
+            if problem:
+                self._mark_bad(iid, path, problem)
+                self.lbl.config(text=f"{self.rows[iid]['no']}강 파일이 이상해요 ({problem}) → 다시 녹화해요")
+                self._update_total()
+                self._persist()
+            else:
+                then()
+        threading.Thread(target=work, daemon=True).start()
+
+    def _busy_encoding(self, state):
+        return state.startswith("인코딩") and not any(w in state for w in ("완료", "실패", "중지"))
+
+    def check_files(self, iids=None, note=""):
+        """상태 체크: 강의마다 녹화 파일이 있는지, 열리는지, 끝까지 녹화됐는지, 인코딩됐는지 확인해서 상태를 고침
+        iids를 주면 그 강의만 (LESSON 추가 때). 용량 줄이기 중이면 잠시 멈추고 먼저 확인"""
+        out_dir = self.app.var_dir.get()
+        jobs = []
+        for iid in (self.tree.get_children() if iids is None else iids):
+            if not self.tree.exists(iid):
+                continue
+            state = self.tree.set(iid, "state")
+            if (self.running and iid == self.cur_row) or "직접 표시" in state:
+                continue  # 지금 녹화 중 / 일부러 완료로 표시한 강의는 그대로
+            lec = self.rows[iid]
+            path = self.rec_files.get(iid) or os.path.join(out_dir, f"제 {lec['no']} 강.mp4")
+            exp, tol = self._expected(self.tree.set(iid, "len"), lec)
+            jobs.append((iid, path, exp, tol))
+        if not jobs:
+            self.lbl.config(text=note or "확인할 강의가 없어요.")
+            return
+        enc = self.app.encode
+        paused = enc.busy and not enc.paused.is_set()
+        if paused:
+            enc.pause(True)
+        self.btn_check.config(state="disabled")
+        self.lbl.config(text=f"상태 체크 중... (0/{len(jobs)})" + ("  ·  용량 줄이기는 잠시 멈춤" if paused else ""))
+
+        def work():
+            import glob
+            res = []
+            for k, (iid, path, exp, tol) in enumerate(jobs):
+                # 원본을 남기고 줄였으면 '제 N 강_small.mp4'가 따로 있음
+                base = os.path.splitext(path)[0]
+                small = sorted(glob.glob(glob.escape(base) + "_small*.mp4"))
+                small = [x for x in small if not x.endswith(".part.mp4")]
+                if not os.path.isfile(path) and small:
+                    path = small[0]
+                if os.path.isfile(path):
+                    info = media_info(path)
+                    enc = is_encoded(info) or bool(small)
+                    res.append((iid, path, True, self._judge(path, info, exp, tol), info["dur"], enc))
+                else:
+                    res.append((iid, path, False, None, None, False))
+                self._ui(self.lbl.config, {"text": f"상태 체크 중... ({k + 1}/{len(jobs)})"})
+            self._ui(self._check_done, res, paused, note)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _check_done(self, res, paused, note=""):
+        if paused:
+            self.app.encode.pause(False)
+        self.btn_check.config(state="normal")
+        good = bad = 0
+        bad_rows = []
+        for iid, path, exists, problem, dur, enc in res:
+            if not self.tree.exists(iid) or (self.running and iid == self.cur_row):
+                continue
+            state = self.tree.set(iid, "state")
+            if not exists:
+                if self._done(state) or self._busy_encoding(state):
+                    problem, path = "파일 없음", None
+                else:
+                    continue  # 아직 녹화 안 한 강의
+            if not problem:  # 끝까지 정상으로 녹화된 파일
+                self.rec_files[iid] = os.path.normpath(path)
+                good += 1
+                if self._busy_encoding(state):
+                    continue  # 용량 줄이기 진행 표시는 그대로
+                new = ("인코딩 완료" if enc else "완료") + f"  ✓ {fmt_secs(dur)}"
+                self.tree.set(iid, "state", new)
+                continue
+            bad += 1
+            bad_rows.append(iid)
+            self._mark_bad(iid, path, problem)
+        self._update_total()
+        self._persist()
+        if bad_rows:
+            self.tree.selection_set(bad_rows)
+            self.tree.see(bad_rows[0])
+        msg = (note + "  ·  " if note else "") + f"상태 체크 - 녹화된 강의 {good}개" \
+            + (f", 다시 녹화할 강의 {bad}개 (선택해 둠)" if bad else "")
+        if bad and self.running:
+            msg += " · 지금 녹화가 끝나면 이어서 녹화해요"
+        elif bad:
+            msg += " · '자동 녹화 시작'을 누르면 녹화해요"
+        if paused:
+            msg += " · 용량 줄이기 다시 시작"
+        self.lbl.config(text=msg)
+
+    def _pending(self):
+        """이번 자동 녹화에서 아직 차례가 오지 않은 행"""
+        try:
+            pos = self.run_rows.index(self.cur_row) if self.cur_row in self.run_rows else -1
+        except ValueError:
+            pos = -1
+        return set(self.run_rows[pos + 1:])
+
+    def _skip(self, i):
+        """자동 녹화가 i번째 강의를 시작하기 직전: 그 사이 표에서 지웠거나 완료로 바꿨으면 건너뜀"""
+        iid = self._row(i)
+        return not iid or not self.tree.exists(iid) or self._done(self.tree.set(iid, "state"))
+
+    def open_file(self, folder):
+        sel = self.tree.selection()
+        path = self.rec_files.get(sel[0]) if sel else None
+        if not path or not os.path.isfile(path):
+            messagebox.showinfo("녹화 파일", "이 강의의 녹화 파일이 없어요." + (f"\n{path}" if path else ""))
+            return
+        if folder:
+            subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
+        else:
+            os.startfile(path)
+
+    def clear_rows(self):
+        if self.running or not self.rows:
+            return
+        if messagebox.askyesno("모두 지우기", "표의 강의를 모두 지울까요?\n(녹화한 파일은 지우지 않아요)"):
+            self.tree.delete(*self.tree.get_children())
+            self.rows.clear()
+            self.rec_files.clear()
+            self._update_total()
+            self._persist()
+
+    def add_dialog(self):
+        """LESSON 입력 창 → Edge 강의 목록에서 찾아 표에 추가"""
+        import lecture_auto
+        if self.running:
+            return
+        d = tk.Toplevel(self)
+        d.title("LESSON 추가")
+        d.transient(self.winfo_toplevel())
+        d.resizable(False, False)
+        f = ttk.Frame(d, padding=16)
+        f.pack(fill="both", expand=True)
+        ttk.Label(f, text="녹화할 LESSON을 입력하세요 (여러 줄 가능)\n"
+                          "예: 제 1 강  /  제 1 강 ~ 제 3 강  /  1~3  /  1, 2, 3").pack(anchor="w")
+        txt = tk.Text(f, width=44, height=12, undo=True, wrap="none")
+        txt.pack(fill="both", expand=True, pady=8)
+        msg = ttk.Label(f, text="", foreground="#b00", wraplength=360, justify="left")
+        msg.pack(anchor="w")
+        bf = ttk.Frame(f)
+        bf.pack(fill="x", pady=(8, 0))
+        ttk.Button(bf, text="취소", command=d.destroy).pack(side="right")
+        btn = ttk.Button(bf, text="추가", command=lambda: ok())
+        btn.pack(side="right", padx=6)
+
+        def ok():
+            lines = txt.get("1.0", "end").splitlines()
+            if not any(x.strip() for x in lines):
+                msg.config(text="LESSON을 입력해 주세요.")
+                return
+            btn.config(state="disabled")
+            msg.config(text="Edge에서 강의 목록 읽는 중...", foreground="#555")
+
+            def work():
+                try:
+                    lecs = lecture_auto.read_lectures()
+                    self._ui(done, lecture_auto.match_lines(lines, lecs), None)
+                except Exception as e:
+                    self._ui(done, None, str(e))
+            threading.Thread(target=work, daemon=True).start()
+
+        def done(pairs, err):
+            if not d.winfo_exists():
+                return
+            btn.config(state="normal")
+            if err:
+                msg.config(text=f"강의 목록을 읽지 못했어요: {err}", foreground="#b00")
+                return
+            have = {self.rows[i]["no"]: i for i in self.tree.get_children()}
+            added, dup, bad = 0, 0, []
+            check = []  # 녹화·인코딩 됐는지 확인할 강의 (새로 넣은 것 + 이미 표에 있던 것)
+            for text, lec in pairs:
+                if not lec:
+                    why = "Edge 목록에 없음" if lecture_auto.lesson_numbers(text) else "LESSON 형식이 아님"
+                    bad.append((text, why))
+                elif lec["no"] in have:
+                    if have[lec["no"]] not in check:
+                        dup += 1
+                        check.append(have[lec["no"]])
+                else:
+                    have[lec["no"]] = iid = self._insert(lec)
+                    check.append(iid)
+                    added += 1
+            self._update_total()
+            self._persist()
+            note = f"{added}개 추가" + (f", 이미 표에 있는 {dup}개는 상태만 확인" if dup else "")
+            self.lbl.config(text=note)
+            if check and not self.running:
+                self.check_files(check, note)
+            if not bad:
+                d.destroy()
+                return
+            txt.delete("1.0", "end")
+            txt.insert("1.0", "\n".join(t for t, _ in bad))
+            msg.config(foreground="#b00", text=note + "\n추가하지 못한 줄 (고쳐서 다시 '추가', 또는 취소):\n"
+                       + "\n".join(f"  · {t}  ←  {w}" for t, w in bad[:6])
+                       + (f"\n  · ... 외 {len(bad) - 6}줄" if len(bad) > 6 else ""))
+
+        txt.bind("<Control-Return>", lambda e: (ok(), "break")[1])
+        d.update_idletasks()
+        top = self.winfo_toplevel()
+        x = top.winfo_rootx() + (top.winfo_width() - d.winfo_reqwidth()) // 2
+        y = top.winfo_rooty() + (top.winfo_height() - d.winfo_reqheight()) // 3
+        d.geometry(f"+{max(0, x)}+{max(0, y)}")
+        d.grab_set()
+        txt.focus_set()
+
     def save(self):
-        self.app.cfg["auto_list"] = self.txt.get("1.0", "end").strip().replace("\n", "\\n")
+        self._save_rows()
         self.app.cfg["auto_gap"] = self.var_gap.get().strip() or "5"
         self.app.cfg.update(
             auto_enc=self.var_enc.get(), auto_enc_when=self.cb_when.get(), auto_enc_quality=self.var_eq.get(),
             auto_enc_res=self.cb_eres.get(), auto_enc_fps=self.cb_efps.get(), auto_enc_gpu=self.var_egpu.get(),
             auto_enc_delete=self.var_edel.get())
 
-    # -- 강의 목록
-    def _read(self, then):
-        """Edge에서 강의 목록 읽기 (별도 스레드) → then(lecs)"""
-        import lecture_auto
-        self.btn_check.config(state="disabled")
-        self.lbl.config(text="Edge에서 강의 목록 읽는 중...")
-
-        def work():
-            try:
-                lecs = lecture_auto.read_lectures()
-                self._ui(self.lbl.config, {"text": ""})
-                self._ui(then, lecs)
-            except Exception as e:
-                self._ui(self.lbl.config, {"text": f"강의 목록을 읽지 못했어요: {e}"})
-            finally:
-                self._ui(self._read_done)
-        threading.Thread(target=work, daemon=True).start()
-
-    def _read_done(self):
-        if not self.running:
-            self.btn_check.config(state="normal")
-
-    def check(self, then=None):
-        def done(lecs):
-            self._show(lecs)
-            if then:
-                then()
-        self._read(done)
-
-    def _show(self, lecs):
-        import lecture_auto
-        lines = self.txt.get("1.0", "end").splitlines()
-        pairs = lecture_auto.match_lines(lines, lecs)
-        self.tree.delete(*self.tree.get_children())
-        self.items = []
-        missing = 0
-        for text, lec in pairs:
-            if lec:
-                self.tree.insert("", "end", iid=str(len(self.items)), values=(
-                    lec["no"], lec["title"], f"{lec['mins']}분" if lec.get("mins") is not None else "", "대기"))
-                self.items.append(lec)
-            else:
-                missing += 1
-                why = ("목록에 없는 LESSON" if lecture_auto.lesson_numbers(text)
-                       else "LESSON 형식이 아님 (예: 제 1 강, 1~3)")
-                self.tree.insert("", "end", values=("?", text, "", why + " - 건너뜀"))
-        total = sum(x.get("mins") or 0 for x in self.items)
-        self.lbl.config(text=f"녹화할 강의 {len(self.items)}개, 약 {total // 60}시간 {total % 60}분"
-                             + (f"  (건너뛸 줄 {missing}개)" if missing else ""))
-
     # -- 실행
     def start(self):
+        import lecture_auto
         if self.running:
             return
-        if self.app.recording or self.app.busy or self.app.sched or self.app.sched_armed:
-            messagebox.showwarning("자동 녹화", "녹화 중이거나 예약이 걸려 있어요. 먼저 끝내거나 취소해 주세요.")
+        if self.app.recording or self.app.busy:
+            messagebox.showwarning("자동 녹화", "녹화나 MP4 변환이 끝난 뒤에 시작해 주세요.")
             return
-        if not self.app.video or self.app.video.get_frame() is None:
+        todo = [iid for iid in self.tree.get_children() if not self._done(self.tree.set(iid, "state"))]
+        unenc = self._unencoded() if self.var_enc.get() else []
+        if not todo and unenc:  # 녹화할 건 없고 인코딩만 남음 → 캡쳐 장치 없이도 됨
+            self.save()
+            save_config(self.app.cfg)
+            self.encode_rows(unenc, "녹화할 강의는 없어요")
+            return
+        if todo and (not self.app.video or self.app.video.get_frame() is None):
             messagebox.showwarning("자동 녹화", "캡쳐 장치의 영상 신호가 아직 들어오지 않았어요.")
             return
-        if not self.txt.get("1.0", "end").strip():
-            messagebox.showwarning("자동 녹화", "녹화할 LESSON을 입력해 주세요. (예: 제 1 강 ~ 제 3 강)")
+        if not todo:
+            messagebox.showwarning("자동 녹화", "녹화할 강의가 없어요. 'LESSON 추가'로 강의를 추가해 주세요."
+                                   + ("\n(표의 강의는 모두 녹화를 마쳤어요)" if self.rows else ""))
             return
         self.save()
         save_config(self.app.cfg)
-        self.check(then=self._go)
+        self.btn_start.config(state="disabled")
+        self.lbl.config(text="Edge에서 강의 목록 확인 중...")
 
-    def _go(self):
+        def work():  # 그 사이 목록이 바뀌었을 수 있으므로 시작할 때 다시 확인
+            try:
+                lecs = lecture_auto.read_lectures()
+                self._ui(self._go, todo, lecs)
+            except Exception as e:
+                self._ui(self._not_started, f"강의 목록을 읽지 못했어요: {e}")
+        threading.Thread(target=work, daemon=True).start()
+
+    def _not_started(self, msg):
+        self.btn_start.config(state="normal")
+        self.lbl.config(text=msg)
+
+    def _go(self, todo, lecs):
         import lecture_auto
-        if not self.items:
-            messagebox.showwarning("자동 녹화", "목록에서 찾은 강의가 없어요.")
+        by_no = {}
+        for lec in lecs:
+            by_no.setdefault(lec["no"], lec)
+        items, self.run_rows = [], []
+        for iid in todo:
+            if not self.tree.exists(iid):
+                continue
+            lec = by_no.get(self.rows[iid]["no"])
+            if lec:
+                self.rows[iid] = lec
+                items.append(lec)
+                self.run_rows.append(iid)
+                self.tree.set(iid, "state", "대기")
+            else:
+                self.tree.set(iid, "state", "Edge 목록에 없음 - 건너뜀")
+        if not items:
+            self._not_started("Edge 목록에서 찾은 강의가 없어요. 강의 목록을 펼쳐 두었는지 확인해 주세요.")
             return
         try:
             gap = max(0, int(self.var_gap.get()))
@@ -1891,71 +2582,138 @@ class AutoPanel(ttk.Frame):
             "start_rec": lambda name: self._call(self._start_rec, name),
             "stop_rec": lambda: self._call(self._stop_rec),
             "is_busy": lambda: self.app.busy,
+            "skip": lambda i: self._call(self._skip, i),
             "status": lambda i, text: self._ui(self._set, i, text),
             "length": lambda i, sec: self._ui(self._set_len, i, sec),
             "log": lambda text: self._ui(self.lbl.config, {"text": text}),
             "finished": lambda msg: self._ui(self._finished, msg),
         }
-        self.runner = lecture_auto.AutoRecorder(list(self.items), hooks, gap=gap)
+        self.runner = lecture_auto.AutoRecorder(items, hooks, gap=gap)
         self.saved = []
-        self.rec_files = {}
+        self.muxed, self.completed = set(), set()
         self.cur_row = None
-        for w in (self.btn_start, self.btn_check):
+        self.stopped = False
+        for w in (self.btn_add, self.btn_clear, self.btn_edge):
             w.config(state="disabled")
-        self.txt.config(state="disabled")
+        self._enc_state()
         self.btn_stop.config(state="normal")
         self.lbl.config(text="자동 녹화 중... (Edge 강의 창과 마우스는 건드리지 마세요)")
         keep_awake(True)
         self.runner.start()
+        unenc = self._unencoded() if self.var_enc.get() else []
+        if unenc:  # 지난번에 녹화만 하고 인코딩 못 한 강의
+            self.encode_rows(unenc, "자동 녹화 중", later=self.cb_when.get() != self.ENC_WHEN[1])
 
     def _stop_rec(self):
         if self.app.recording:
             self.app.stop_recording()
 
+    def _row(self, i):
+        return self.run_rows[i] if 0 <= i < len(self.run_rows) else None
+
     def _set_len(self, i, sec):
         """실제 영상 길이 (예: 48분 15.7초)"""
-        if self.tree.exists(str(i)):
-            self.tree.set(str(i), "len", f"{int(sec // 60)}분 {sec % 60:.1f}초")
+        iid = self._row(i)
+        if iid and self.tree.exists(iid):
+            self.tree.set(iid, "len", f"{int(sec // 60)}분 {sec % 60:.1f}초")
+            self._persist()
 
     def _set(self, i, text):
-        self.cur_row = str(i)
-        if self.tree.exists(str(i)):
-            self.tree.set(str(i), "state", text)
+        iid = self._row(i)
+        self.cur_row = iid
+        if iid and self.tree.exists(iid):
+            self.tree.set(iid, "state", text)
+            if text == "완료":
+                self.completed.add(iid)
+                self._dispatch()
             if text.startswith(("강의 여는", "녹화 시작")):
-                self.tree.see(str(i))
+                self.tree.see(iid)
+            if not text.startswith("녹화 중"):  # 진행 시간(0.5초마다)은 빼고 상태가 바뀔 때만 저장
+                self._persist()
 
     def stop(self):
         if self.runner and messagebox.askyesno(
-                "자동 녹화 중지", "자동 녹화를 멈출까요?\n지금 녹화 중인 강의는 여기까지 저장돼요."):
+                "자동 녹화 중지", "자동 녹화를 멈출까요?\n"
+                                "지금 녹화 중인 강의는 다음에 시작하면 처음부터 다시 녹화해요."):
+            self.stopped = True
             self.runner.stop()
             self.btn_stop.config(state="disabled")
             self.lbl.config(text="멈추는 중...")
 
     def _finished(self, msg):
         self.runner = None
-        for w in (self.btn_start, self.btn_check):
+        for w in (self.btn_start, self.btn_add, self.btn_del, self.btn_clear, self.btn_edge):
             w.config(state="normal")
-        self.txt.config(state="normal")
+        self._enc_state()
         self.btn_stop.config(state="disabled")
         if self.var_enc.get() and self.saved:
             self._send_encode(self.saved)
-            msg += f"  ·  용량 줄이기 {len(self.saved)}개 시작 ('용량 줄이기' 탭에서 진행 상황 확인)"
+            msg += f"  ·  용량 줄이기 {len(self.saved)}개 시작 (진행 상황은 표의 '상태'에 표시)"
             self.saved = []
         self.lbl.config(text=msg)
-        self.app.lbl_status.config(text=msg)
-        if not (self.app.recording or self.app.sched or self.app.busy or self.app.encode.busy):
+        self._update_total()
+        self._persist()
+        if self.var_shutdown.get() and not self.stopped:
+            self.lbl.config(text=msg + "  ·  모든 작업이 끝나면 컴퓨터를 꺼요")
+            self.after(3000, self._shutdown_when_idle)
+        elif not (self.app.recording or self.app.sched or self.app.busy or self.app.encode.busy):
             keep_awake(False)
+
+    def _shutdown_when_idle(self):
+        """MP4 변환·용량 줄이기까지 모두 끝나면 1분 뒤 컴퓨터 종료 (그 사이 취소 가능)"""
+        if not self.var_shutdown.get() or self.running:
+            return
+        if self.app.busy or self.app.encode.busy or self.app.recording:
+            self.after(3000, self._shutdown_when_idle)
+            return
+        d = tk.Toplevel(self)
+        d.title("컴퓨터 종료")
+        d.transient(self.winfo_toplevel())
+        d.resizable(False, False)
+        d.attributes("-topmost", True)
+        f = ttk.Frame(d, padding=20)
+        f.pack()
+        lbl = ttk.Label(f, text="", font=("", 11), justify="center")
+        lbl.pack(pady=(0, 14))
+        left = [60]
+
+        def cancel():
+            left[0] = None
+            self.var_shutdown.set(False)
+            d.destroy()
+            self.lbl.config(text="컴퓨터 종료를 취소했어요.")
+            keep_awake(False)
+
+        ttk.Button(f, text="취소", style="Big.TButton", command=cancel).pack()
+        d.protocol("WM_DELETE_WINDOW", cancel)
+
+        def count():
+            if left[0] is None or not d.winfo_exists():
+                return
+            if left[0] <= 0:
+                d.destroy()
+                self.app.shutdown_pc()
+                return
+            lbl.config(text=f"모든 작업이 끝났어요.\n{left[0]}초 뒤에 컴퓨터를 꺼요.")
+            left[0] -= 1
+            self.after(1000, count)
+        count()
+        d.update_idletasks()
+        top = self.winfo_toplevel()
+        d.geometry(f"+{top.winfo_rootx() + (top.winfo_width() - d.winfo_reqwidth()) // 2}"
+                   f"+{top.winfo_rooty() + (top.winfo_height() - d.winfo_reqheight()) // 3}")
 
 
 class App:
-    def __init__(self, root):
+    def __init__(self, root, mode="direct", cfg=None):
         self.root = root
+        self.mode = mode  # "auto": 자동 녹화 화면 하나, "direct": 탭 4개
         root.title(APP_NAME)
         try:
             root.iconbitmap(resource_path("capturedeck.ico"))
         except tk.TclError:
             pass
-        self.cfg = load_config()
+        self.cfg = load_config() if cfg is None else cfg
         self.video = None
         self.audio = None
         self.recording = False
@@ -1978,128 +2736,196 @@ class App:
 
     # ---- UI
     def _build_ui(self):
-        self.nb = ttk.Notebook(self.root)
-        self.nb.pack(fill="both", expand=True)
-        r = ttk.Frame(self.nb)
-        self.nb.add(r, text="  영상 캡쳐  ")
-        self.trim = TrimPanel(self.nb, get_dir=lambda: self.var_dir.get())
-        self.nb.add(self.trim, text="  영상 자르기  ")
-        self.recover = RecoverPanel(self.nb, get_dir=lambda: self.var_dir.get(),
+        auto = self.mode == "auto"
+        self._style()
+        if auto:
+            # 자동 녹화: 탭 없이 한 화면. 복구/자르기/용량 줄이기 패널은 화면에 넣지 않고 기능만 씀
+            self.nb = None
+            self.auto = AutoPanel(self.root, self)
+            self.auto.pack(fill="both", expand=True)
+            r = self.cap = self.auto.left
+            parent = ttk.Frame(self.root)  # pack하지 않음 (안 보이는 패널들의 부모)
+        else:
+            self.nb = ttk.Notebook(self.root)
+            self.nb.pack(fill="both", expand=True)
+            self.auto = NoAuto()
+            r = self.cap = ttk.Frame(self.nb)
+            parent = self.nb
+        self.recover = RecoverPanel(parent, get_dir=lambda: self.var_dir.get(),
                                     get_active=lambda: self.rec_base if (self.recording or self.busy) else None,
                                     on_idle=self._maybe_close)
-        self.nb.add(self.recover, text="  녹화 복구  ")
-        self.encode = EncodePanel(self.nb, get_dir=lambda: self.var_dir.get(), cfg=self.cfg,
+        self.trim = TrimPanel(parent, get_dir=lambda: self.var_dir.get())
+        self.encode = EncodePanel(parent, get_dir=lambda: self.var_dir.get(), cfg=self.cfg,
                                   on_busy=self._on_encode_busy)
-        self.nb.add(self.encode, text="  용량 줄이기  ")
-        self.auto = AutoPanel(self.nb, self)
-        self.nb.add(self.auto, text="  자동 녹화  ")
+        if not auto:  # 탭 순서: 영상 캡쳐 / 녹화 복구 / 영상 자르기 / 용량 줄이기
+            self.nb.add(r, text="  영상 캡쳐  ")
+            self.nb.add(self.recover, text="  녹화 복구  ")
+            self.nb.add(self.trim, text="  영상 자르기  ")
+            self.nb.add(self.encode, text="  용량 줄이기  ")
+            self.nb.bind("<<NotebookTabChanged>>", self._on_tab)
         self.encode.on_auto_done = self.auto._encoded
+        if auto:
+            self.encode.on_auto_progress = self.auto.encode_progress
         self.trim.get_compress = self.encode.options
         self.trim.send_to_encode = self._send_to_encode
         self.trim.var_compress.set(bool(self.cfg.get("trim_compress", True)))
-        self.nb.bind("<<NotebookTabChanged>>", self._on_tab)
         self.root.bind("<space>", self._on_space)
 
         # 미리보기: 아래 조작부(높이 고정)를 뺀 나머지 공간을 모두 차지
         self.preview = FitView(r)
-        self.preview.pack(fill="both", expand=True, padx=8, pady=8)
+        self.preview.pack(fill="both", expand=True, padx=10, pady=(10, 8))
         self.prev_next = 0.0  # 다음 미리보기를 그릴 시각 (그리는 데 걸린 시간에 맞춰 조절)
 
-        f = ttk.Frame(r)
-        f.pack(fill="x", padx=8)
-        ttk.Label(f, text="비디오 장치").grid(row=0, column=0, sticky="w")
-        self.cb_video = ttk.Combobox(f, state="readonly", width=38)
-        self.cb_video.grid(row=0, column=1, padx=4, pady=2)
-        ttk.Label(f, text="오디오 장치").grid(row=1, column=0, sticky="w")
-        self.cb_audio = ttk.Combobox(f, state="readonly", width=38)
-        self.cb_audio.grid(row=1, column=1, padx=4, pady=2)
+        if auto:
+            # 자동 녹화: 설정은 탭 두 개로 접어 두고 미리보기를 크게
+            snb = ttk.Notebook(r)
+            snb.pack(fill="x", padx=10, pady=(0, 10))
+            dev = ttk.Frame(snb, padding=(10, 8))
+            snb.add(dev, text="  캡쳐 장치  ")
+            save = ttk.Frame(snb, padding=(10, 8))
+            snb.add(save, text="  저장 · 용량 줄이기  ")
+            self._build_devices(dev)
+            fo = ttk.Frame(save)
+            fo.pack(fill="x")
+            ttk.Label(fo, text="저장 폴더").pack(side="left", padx=(0, 8))
+            self._build_folder(fo)
+            self.auto.build_encode(save)
+            self._build_schedule(ttk.Frame(r))  # 자동 녹화에서는 예약을 쓰지 않음 (화면에 넣지 않음)
+        else:
+            sec = ttk.Frame(r)
+            sec.pack(fill="x", padx=10, pady=(0, 8))
+            sec.columnconfigure(1, weight=1)
+            dev = ttk.LabelFrame(sec, text="캡쳐 장치", style="Section.TLabelframe", padding=(10, 4, 10, 8))
+            dev.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=(0, 10))
+            self._build_devices(dev)
+            sch = ttk.LabelFrame(sec, text="예약 녹화", style="Section.TLabelframe", padding=(10, 4, 10, 8))
+            sch.grid(row=0, column=1, sticky="nsew")
+            self._build_schedule(sch)
+            fo = ttk.LabelFrame(sec, text="저장 폴더", style="Section.TLabelframe", padding=(10, 4, 10, 8))
+            fo.grid(row=1, column=1, sticky="nsew", pady=(8, 0))
+            self._build_folder(fo)
 
-        ttk.Label(f, text="해상도").grid(row=0, column=2, padx=(12, 0), sticky="w")
-        self.cb_res = ttk.Combobox(f, values=RESOLUTIONS, width=11, state="readonly")
+        b = ttk.Frame(r)
+        self.btn_rec = ttk.Button(b, text="●  녹화 시작", style="Big.TButton", command=self.toggle_rec)
+        self.btn_rec.pack(side="left")
+        self.var_trim_after = tk.BooleanVar(value=self.cfg.get("trim_after", True))
+        ttk.Checkbutton(b, text="녹화 종료 후 바로 편집", variable=self.var_trim_after,
+                        command=self.on_trim_after).pack(side="right")
+        if auto:  # 녹화 시간·장치 상태는 아래 상태 줄 오른쪽에
+            bar = self.auto.statusbar
+            self.lbl_status = ttk.Label(bar, text="", style="Hint.TLabel")
+            self.lbl_status.pack(side="right")
+            self.lbl_time = ttk.Label(bar, text="00:00:00", font=("Consolas", 11))
+            self.lbl_time.pack(side="right", padx=(0, 14))
+        else:
+            ttk.Separator(r).pack(fill="x")
+            b.pack(fill="x", padx=10, pady=8)
+            self.lbl_time = ttk.Label(b, text="00:00:00", font=("Consolas", 16))
+            self.lbl_time.pack(side="left", padx=14)
+            self.lbl_status = ttk.Label(b, text="", style="Hint.TLabel")
+            self.lbl_status.pack(side="left")
+
+    def _style(self):
+        """버튼·구역 제목·안내 글자 모양"""
+        st = ttk.Style(self.root)
+        try:
+            fam = tkfont.nametofont("TkDefaultFont").actual("family")
+        except tk.TclError:
+            fam = ""
+        st.configure("Big.TButton", font=(fam, 10, "bold"), padding=(14, 5))
+        st.configure("Section.TLabelframe.Label", font=(fam, 9, "bold"), foreground="#1a5fb4")
+        st.configure("Hint.TLabel", foreground="#666")
+        st.configure("Treeview", rowheight=24)
+
+    def _build_devices(self, f):
+        """캡쳐 장치: 비디오/오디오 장치, 해상도/FPS, 새로고침, 소리 듣기, 오디오 레벨"""
+        g = ttk.Frame(f)
+        g.pack(fill="x")
+        ttk.Label(g, text="비디오 장치").grid(row=0, column=0, sticky="w")
+        self.cb_video = ttk.Combobox(g, state="readonly", width=34)
+        self.cb_video.grid(row=0, column=1, padx=(8, 0), pady=3, sticky="w")
+        ttk.Label(g, text="오디오 장치").grid(row=1, column=0, sticky="w")
+        self.cb_audio = ttk.Combobox(g, state="readonly", width=34)
+        self.cb_audio.grid(row=1, column=1, padx=(8, 0), pady=3, sticky="w")
+        ttk.Label(g, text="해상도").grid(row=0, column=2, padx=(16, 0), sticky="w")
+        self.cb_res = ttk.Combobox(g, values=RESOLUTIONS, width=10, state="readonly")
         self.cb_res.set(self.cfg["resolution"])
-        self.cb_res.grid(row=0, column=3, padx=4)
-        ttk.Label(f, text="FPS").grid(row=1, column=2, padx=(12, 0), sticky="w")
-        self.cb_fps = ttk.Combobox(f, values=FPS_LIST, width=11, state="readonly")
+        self.cb_res.grid(row=0, column=3, padx=(8, 0), sticky="w")
+        ttk.Label(g, text="FPS").grid(row=1, column=2, padx=(16, 0), sticky="w")
+        self.cb_fps = ttk.Combobox(g, values=FPS_LIST, width=10, state="readonly")
         self.cb_fps.set(self.cfg["fps"])
-        self.cb_fps.grid(row=1, column=3, padx=4)
-
-        ttk.Button(f, text="장치 새로고침", command=lambda: self.refresh_devices(auto=False)
-                   ).grid(row=0, column=4, padx=8)
+        self.cb_fps.grid(row=1, column=3, padx=(8, 0), sticky="w")
+        ttk.Button(g, text="장치 새로고침", command=lambda: self.refresh_devices(auto=False)
+                   ).grid(row=0, column=4, padx=(16, 0), sticky="w")
         self.var_mon = tk.BooleanVar(value=self.cfg.get("monitor", False))
-        ttk.Checkbutton(f, text="소리 듣기(모니터링)", variable=self.var_mon,
-                        command=self.on_monitor).grid(row=1, column=4, padx=8)
-
+        ttk.Checkbutton(g, text="소리 듣기", variable=self.var_mon,
+                        command=self.on_monitor).grid(row=1, column=4, padx=(16, 0), sticky="w")
+        ttk.Label(g, text="오디오 레벨").grid(row=2, column=0, sticky="w", pady=(4, 0))
+        self.level_bar = ttk.Progressbar(g, maximum=100)
+        self.level_bar.grid(row=2, column=1, padx=(8, 0), pady=(4, 0), sticky="ew")
+        ttk.Label(g, text="듣는 장치").grid(row=2, column=2, padx=(16, 0), pady=(4, 0), sticky="w")
+        self.out_devs = list_output_devices()
+        self.cb_out = ttk.Combobox(g, state="readonly", width=28, values=[n for _, n in self.out_devs])
+        saved = self.cfg.get("monitor_out", "")
+        if saved not in self.cb_out["values"]:
+            saved = DEFAULT_OUT
+            if "TO USB" in default_output_name().upper():  # 기본 출력이 캡쳐 보드로 가면 다른 장치(스피커/모니터)를
+                saved = next((n for i, n in self.out_devs if i is not None and "TO USB" not in n.upper()), saved)
+        self.cb_out.set(saved)
+        self.cb_out.grid(row=2, column=3, columnspan=2, padx=(8, 0), pady=(4, 0), sticky="ew")
+        self.cb_out.bind("<<ComboboxSelected>>", lambda e: self.on_monitor())
         for cb in (self.cb_video, self.cb_audio, self.cb_res, self.cb_fps):
             cb.bind("<<ComboboxSelected>>", lambda e: self.on_settings_changed())
 
-        a = ttk.Frame(r)
-        a.pack(fill="x", padx=8, pady=(6, 0))
-        ttk.Label(a, text="오디오 레벨").pack(side="left")
-        self.level_bar = ttk.Progressbar(a, maximum=100, length=400)
-        self.level_bar.pack(side="left", padx=8)
-
-        o = ttk.Frame(r)
-        o.pack(fill="x", padx=8, pady=6)
-        ttk.Label(o, text="저장 폴더").pack(side="left")
+    def _build_folder(self, f):
+        """저장 폴더 입력 + 폴더 선택/열기"""
         self.var_dir = tk.StringVar(value=self.cfg["out_dir"])
-        ttk.Entry(o, textvariable=self.var_dir, width=60).pack(side="left", padx=6)
-        ttk.Button(o, text="폴더 선택", command=self.choose_dir).pack(side="left")
-        ttk.Button(o, text="폴더 열기", command=self.open_dir).pack(side="left", padx=4)
+        ttk.Button(f, text="열기", width=6, command=self.open_dir).pack(side="right")
+        ttk.Button(f, text="선택...", width=7, command=self.choose_dir).pack(side="right", padx=(6, 6))
+        ttk.Entry(f, textvariable=self.var_dir).pack(side="left", fill="x", expand=True)
 
-        s = ttk.Frame(r)
-        s.pack(fill="x", padx=8, pady=(0, 6))
-        ttk.Label(s, text="예약 녹화").grid(row=0, column=0, rowspan=2, sticky="w", padx=(0, 8))
+    def _build_schedule(self, s):
+        """예약 녹화: 시간 지정 / 지금부터 몇 시간"""
         self.var_s_mode = tk.StringVar(value=self.cfg["sched_mode"])
         # 방식 1: 몇 시 몇 분부터 몇 시 몇 분까지
         r1 = ttk.Frame(s)
-        r1.grid(row=0, column=1, sticky="w")
-        self.rb_range = ttk.Radiobutton(r1, text="시간 지정", value="range", variable=self.var_s_mode)
+        r1.grid(row=0, column=0, sticky="w", pady=2)
+        self.rb_range = ttk.Radiobutton(r1, text="시간 지정", value="range", variable=self.var_s_mode, width=9)
         self.rb_range.pack(side="left")
         self.var_s_start = tk.StringVar(value=self._clock_or(self.cfg["sched_start"], "09:00:00"))
         self.var_s_end = tk.StringVar(value=self._clock_or(self.cfg["sched_end"], "10:00:00"))
         self.ent_s_start = ttk.Entry(r1, textvariable=self.var_s_start, width=9, justify="center")
-        self.ent_s_start.pack(side="left", padx=(6, 2))
+        self.ent_s_start.pack(side="left", padx=(6, 4))
         ttk.Label(r1, text="부터").pack(side="left")
         self.ent_s_end = ttk.Entry(r1, textvariable=self.var_s_end, width=9, justify="center")
-        self.ent_s_end.pack(side="left", padx=(6, 2))
-        ttk.Label(r1, text="까지  (24시간, 예: 14:30:00)").pack(side="left")
+        self.ent_s_end.pack(side="left", padx=(8, 4))
+        ttk.Label(r1, text="까지").pack(side="left")
+        ttk.Label(r1, text="(24시간, 예: 14:30:00)", style="Hint.TLabel").pack(side="left", padx=(8, 0))
         # 방식 2: 지금부터 몇 시간 몇 분 몇 초간
         r2 = ttk.Frame(s)
-        r2.grid(row=1, column=1, sticky="w")
-        self.rb_dur = ttk.Radiobutton(r2, text="지금부터", value="duration", variable=self.var_s_mode)
+        r2.grid(row=1, column=0, sticky="w", pady=2)
+        self.rb_dur = ttk.Radiobutton(r2, text="지금부터", value="duration", variable=self.var_s_mode, width=9)
         self.rb_dur.pack(side="left")
         dh, dm, ds = self._initial_duration()
         self.var_s_h, self.var_s_m, self.var_s_s = (tk.StringVar(value=str(v)) for v in (dh, dm, ds))
         self.dur_entries = []
         for i, (var, unit) in enumerate(((self.var_s_h, "시간"), (self.var_s_m, "분"), (self.var_s_s, "초간"))):
             ent = ttk.Entry(r2, textvariable=var, width=4, justify="center")
-            ent.pack(side="left", padx=(6 if i == 0 else 4, 2))
+            ent.pack(side="left", padx=(6 if i == 0 else 8, 4))
             ttk.Label(r2, text=unit).pack(side="left")
             self.dur_entries.append(ent)
         # 지금부터 녹화하면 몇 시 몇 분 몇 초에 끝나는지 실시간 표시
         self.lbl_s_until = ttk.Label(r2, text="", foreground="#1a5fb4")
         self.lbl_s_until.pack(side="left", padx=(10, 0))
         self.btn_sched = ttk.Button(s, text="예약", command=self.toggle_schedule)
-        self.btn_sched.grid(row=0, column=2, padx=12, sticky="ew")
+        self.btn_sched.grid(row=0, column=1, padx=(16, 0), sticky="ew")
         self.btn_sched_end = ttk.Button(s, text="종료 시간 변경", command=self.change_sched_end, state="disabled")
-        self.btn_sched_end.grid(row=1, column=2, padx=12, sticky="ew")
+        self.btn_sched_end.grid(row=1, column=1, padx=(16, 0), sticky="ew")
         for e in (self.ent_s_end, *self.dur_entries):  # 예약 중 Enter로도 종료 시간 변경
             e.bind("<Return>", lambda ev: self.change_sched_end() if self.sched else None)
-        self.lbl_sched = ttk.Label(s, text="예약 없음")
-        self.lbl_sched.grid(row=0, column=3, rowspan=2, sticky="w")
+        self.lbl_sched = ttk.Label(s, text="예약 없음", style="Hint.TLabel")
+        self.lbl_sched.grid(row=0, column=2, rowspan=2, sticky="w", padx=(16, 0))
         self.sched_inputs = (self.rb_range, self.rb_dur, self.ent_s_start, self.ent_s_end, *self.dur_entries)
-
-        b = ttk.Frame(r)
-        b.pack(fill="x", padx=8, pady=(0, 8))
-        self.btn_rec = ttk.Button(b, text="● 녹화 시작", command=self.toggle_rec)
-        self.btn_rec.pack(side="left")
-        self.lbl_time = ttk.Label(b, text="00:00:00", font=("Consolas", 14))
-        self.lbl_time.pack(side="left", padx=12)
-        self.lbl_status = ttk.Label(b, text="")
-        self.lbl_status.pack(side="left", padx=8)
-        self.var_trim_after = tk.BooleanVar(value=self.cfg.get("trim_after", True))
-        ttk.Checkbutton(b, text="녹화 종료 후 바로 편집", variable=self.var_trim_after,
-                        command=self.on_trim_after).pack(side="right", padx=8)
 
     # ---- 장치
     def refresh_devices(self, auto):
@@ -2170,14 +2996,30 @@ class App:
         if idx is None:
             return
         self.audio = AudioWorker(idx)
+        self.audio.out_device = self._out_device()
         if self.audio.start():
             self.audio.set_monitor(self.var_mon.get())
 
+    def _out_device(self):
+        name = self.cb_out.get()
+        return next((i for i, n in self.out_devs if n == name), None)
+
     def on_monitor(self):
         self.cfg["monitor"] = self.var_mon.get()
+        self.cfg["monitor_out"] = self.cb_out.get()
         save_config(self.cfg)
         if self.audio:
+            self.audio.set_out_device(self._out_device())
             self.audio.set_monitor(self.var_mon.get())
+        # 듣는 장치가 캡쳐 보드로 들어가는 출력(예: HDMI)이면 소리가 녹화에 다시 섞이고 스피커로는 안 나옴
+        out = self.cb_out.get()
+        if self.var_mon.get() and out == DEFAULT_OUT:
+            out = default_output_name()
+        if self.var_mon.get() and out and "TO USB" in out.upper():
+            messagebox.showwarning(
+                "소리 듣기", f"듣는 장치 '{out}'은(는) 캡쳐 보드로 들어가는 출력 같아요.\n"
+                           "이 장치로 내보내면 스피커로는 안 들리고, 녹화에 소리가 겹쳐 들어갈 수 있어요.\n"
+                           "'듣는 장치'에서 스피커나 헤드폰을 골라 주세요.")
 
     def choose_dir(self):
         d = filedialog.askdirectory(initialdir=self.var_dir.get())
@@ -2507,7 +3349,8 @@ class App:
             self.auto.on_saved(out)
         if out and self.var_trim_after.get() and not self.recording and not self.auto.running \
                 and self.trim.load(out):
-            self.nb.select(self.trim)
+            if self.nb:
+                self.nb.select(self.trim)
 
     def on_trim_after(self):
         self.cfg["trim_after"] = self.var_trim_after.get()
@@ -2519,7 +3362,7 @@ class App:
         # 미리보기가 크면 그리는 데 시간이 걸리므로, 그 시간에 맞춰 그리는 횟수를 줄임
         # (화면 그리기가 녹화를 방해하지 않도록 녹화 중에는 더 여유를 둠)
         now = time.perf_counter()
-        if self.video and self.nb.index("current") == 0 and now >= self.prev_next:
+        if self.video and (self.nb is None or self.nb.select() == str(self.cap)) and now >= self.prev_next:
             frame = self.video.get_frame()
             if frame is not None and self.video.status == "영상 정상":
                 self.preview.show(self.preview.to_rgb(frame))
@@ -2540,7 +3383,7 @@ class App:
         if not self.busy:
             v = self.video.status if self.video else "비디오 장치 없음"
             a = "오디오 정상" if (self.audio and self.audio.running) else "오디오 연결 안 됨"
-            if self.audio and self.audio.error and not self.audio.running:
+            if self.audio and self.audio.error and (not self.audio.running or self.audio.error.startswith("모니터링")):
                 a += f" ({self.audio.error[:40]})"
             self.lbl_status.config(text=f"{v}  |  {a}")
         self._check_schedule()
@@ -2557,7 +3400,8 @@ class App:
 
     def _send_to_encode(self, path):
         self.encode.add_files([path])
-        self.nb.select(self.encode)
+        if self.nb:
+            self.nb.select(self.encode)
 
     def _on_encode_busy(self, busy):
         """인코딩 중에는 절전 방지 (끝나면 녹화/예약/변환 중이 아닐 때만 해제)"""
@@ -2609,7 +3453,8 @@ class App:
 
     def _on_space(self, ev):
         """자르기 탭에서 스페이스바 = 재생/일시정지 (입력칸에 글자 입력 중일 때는 제외)"""
-        if self.nb.index("current") == 1 and not isinstance(ev.widget, (tk.Entry, ttk.Entry)):
+        if self.nb and self.nb.select() == str(self.trim) \
+                and not isinstance(ev.widget, (tk.Entry, ttk.Entry, tk.Text)):
             self.trim.toggle_play()
 
     def _restore_window(self):
@@ -2625,7 +3470,8 @@ class App:
             gsm = ctypes.windll.user32.GetSystemMetrics
             vx, vy, vw, vh = gsm(76), gsm(77), gsm(78), gsm(79)
         # 예전 설정은 위치만("+x+y"), 지금은 크기까지("WxH+x+y") 저장
-        m = re.fullmatch(r"(?:(\d+)x(\d+))?\+(-?\d+)\+(-?\d+)", self.cfg.get("geometry", ""))
+        pre = "auto_" if self.mode == "auto" else ""
+        m = re.fullmatch(r"(?:(\d+)x(\d+))?\+(-?\d+)\+(-?\d+)", self.cfg.get(pre + "geometry", ""))
         w, h = (int(m.group(1)), int(m.group(2))) if m and m.group(1) else (0, 0)
         if w < min_w or h < min_h:  # 처음 실행: 화면의 80% 크기
             w, h = max(min_w, int(sw * 0.8)), max(min_h, int(sh * 0.8))
@@ -2636,42 +3482,143 @@ class App:
             if vx - 50 <= x < vx + vw - 100 and vy <= y < vy + vh - 100:
                 geo += f"+{x}+{y}"
         self.root.geometry(geo)
-        if self.cfg.get("zoomed"):
+        if self.cfg.get(pre + "zoomed"):
             try:
                 self.root.state("zoomed")
             except tk.TclError:
                 pass
-        try:
-            self.nb.select(int(self.cfg.get("tab", 0)))
-        except (ValueError, tk.TclError):
-            pass
+        if self.nb:
+            try:
+                self.nb.select(int(self.cfg.get("tab", 0)))
+            except (ValueError, tk.TclError):
+                pass
 
     def _window_geometry(self):
         """저장할 창 크기·위치. 최대화 상태면 최대화 여부만 바꾸고 원래 크기는 그대로 둠"""
-        zoomed = self.root.state() == "zoomed"
-        if zoomed:
-            return {"zoomed": True}
-        return {"zoomed": False, "geometry": self.root.wm_geometry()}
+        pre = "auto_" if self.mode == "auto" else ""
+        if self.root.state() == "zoomed":
+            return {pre + "zoomed": True}
+        return {pre + "zoomed": False, pre + "geometry": self.root.wm_geometry()}
+
+    def shutdown_pc(self):
+        """설정을 저장하고 컴퓨터 종료"""
+        try:
+            self.save_all()
+        except Exception:
+            pass
+        if sys.platform == "win32":
+            subprocess.Popen(["shutdown", "/s", "/t", "5"], creationflags=0x08000000)
+        self.on_close()
 
     def save_all(self):
         """현재 화면의 모든 설정을 settings.ini에 저장"""
         self.cfg.update(
             video=self.cb_video.get(), audio=self.cb_audio.get(),
             resolution=self.cb_res.get(), fps=self.cb_fps.get(),
-            out_dir=self.var_dir.get(), monitor=self.var_mon.get(),
+            out_dir=self.var_dir.get(), monitor=self.var_mon.get(), monitor_out=self.cb_out.get(),
             sched_mode=self.var_s_mode.get(), sched_start=self.var_s_start.get().strip(),
             sched_end=self.var_s_end.get().strip(),
             sched_duration=":".join(v.get().strip() or "0" for v in (self.var_s_h, self.var_s_m, self.var_s_s)),
             trim_after=self.var_trim_after.get(), trim_compress=self.trim.var_compress.get(),
-            **self._window_geometry(),
-            tab=str(self.nb.index("current")))
+            **self._window_geometry())
+        if self.nb:
+            self.cfg["tab"] = str(self.nb.index("current"))
         self.encode.save_options()
         self.auto.save()
         save_config(self.cfg)
 
 
+def choose_mode(root, cfg):
+    """시작 화면: 자동 녹화 / 직접 녹화 고르기 → "auto" / "direct" (창을 닫으면 None)"""
+    root.withdraw()
+    d = tk.Toplevel(root)
+    d.title(APP_NAME)
+    try:
+        d.iconbitmap(resource_path("capturedeck.ico"))
+    except tk.TclError:
+        pass
+    d.resizable(False, False)
+    result = []
+
+    def pick(mode):
+        result.append(mode)
+        d.destroy()
+
+    f = ttk.Frame(d, padding=(28, 22))
+    f.pack()
+    ttk.Label(f, text="어떻게 녹화할까요?", font=("", 14, "bold")).pack(pady=(0, 16))
+    choices = (("auto", "자동 녹화", "온라인 강의를 LESSON 목록대로\n하나씩 열어서 녹화해요"),
+               ("direct", "직접 녹화", "영상 캡쳐 · 녹화 복구 ·\n영상 자르기 · 용량 줄이기"))
+    row = ttk.Frame(f)
+    row.pack()
+    buttons = {}
+    for i, (mode, title, desc) in enumerate(choices):
+        btn = tk.Button(row, text=f"{title}\n\n{desc}", width=30, height=6, font=("", 11), cursor="hand2",
+                        relief="groove", bg="#f7f7f7", activebackground="#e4eefb", command=lambda m=mode: pick(m))
+        btn.grid(row=0, column=i, padx=8)
+        buttons[mode] = btn
+    ttk.Label(f, text="← → 키로 고르고 Enter", foreground="#888").pack(pady=(14, 0))
+    last = cfg.get("mode") if cfg.get("mode") in buttons else "auto"
+    buttons[last].config(bg="#e4eefb")
+    sel = [last]
+
+    def move(mode):
+        buttons[sel[0]].config(bg="#f7f7f7")
+        sel[0] = mode
+        buttons[mode].config(bg="#e4eefb")
+    d.bind("<Left>", lambda e: move("auto"))
+    d.bind("<Right>", lambda e: move("direct"))
+    d.bind("<Return>", lambda e: pick(sel[0]))
+    d.bind("<Escape>", lambda e: d.destroy())
+    # 지난번 창이 있던 모니터 가운데에
+    d.update_idletasks()
+    w, h = d.winfo_reqwidth(), d.winfo_reqheight()
+    m = re.fullmatch(r"(?:(\d+)x(\d+))?\+(-?\d+)\+(-?\d+)", cfg.get("geometry", "") or cfg.get("auto_geometry", ""))
+    if m and m.group(1):
+        cx, cy = int(m.group(3)) + int(m.group(1)) // 2, int(m.group(4)) + int(m.group(2)) // 2
+    else:
+        cx, cy = d.winfo_screenwidth() // 2, d.winfo_screenheight() // 2
+    d.geometry(f"+{max(0, cx - w // 2)}+{max(0, cy - h // 2)}")
+    d.focus_force()
+    root.wait_window(d)
+    if not result:
+        return None
+    cfg["mode"] = result[0]
+    save_config(cfg)
+    root.deiconify()
+    return result[0]
+
+
+def setup_error_log():
+    """오류를 error.log에 남김 (창 프로그램이라 화면에 안 보이므로). 갑자기 꺼지는 경우도 기록"""
+    import faulthandler
+    import traceback
+    path = APP_DIR / "error.log"
+    try:
+        f = open(path, "a", encoding="utf-8", buffering=1)
+    except OSError:
+        return
+    f.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} 시작\n")
+    faulthandler.enable(f)
+
+    def write(kind, et, ev, tb):
+        f.write(f"--- {time.strftime('%H:%M:%S')} {kind}\n" + "".join(traceback.format_exception(et, ev, tb)))
+    sys.excepthook = lambda et, ev, tb: write("오류", et, ev, tb)
+    threading.excepthook = lambda a: write(f"스레드 오류 ({a.thread.name if a.thread else ''})",
+                                           a.exc_type, a.exc_value, a.exc_traceback)
+    tk.Tk.report_callback_exception = lambda self, et, ev, tb: write("화면 오류", et, ev, tb)
+    import atexit
+    atexit.register(lambda: f.write(f"===== {time.strftime('%H:%M:%S')} 종료\n"))
+
+
 if __name__ == "__main__":
+    setup_error_log()
     threading.Thread(target=video_encoder_args, daemon=True).start()  # 인코더 확인을 미리 해 둠
     root = tk.Tk()
-    App(root)
-    root.mainloop()
+    config = load_config()
+    mode = choose_mode(root, config)
+    if mode:
+        App(root, mode, config)
+        root.mainloop()
+    else:
+        root.destroy()
