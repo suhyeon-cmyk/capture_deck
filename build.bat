@@ -17,6 +17,8 @@ python -m PyInstaller --noconfirm --clean --onefile --windowed ^
   --name CaptureDeck ^
   --icon capturedeck.ico ^
   --add-data "capturedeck.ico;." ^
+  --add-data "capturedeck.png;." ^
+  --splash capturedeck_splash.png ^
   --version-file version_info.txt ^
   --collect-data imageio_ffmpeg ^
   --collect-all pygrabber ^

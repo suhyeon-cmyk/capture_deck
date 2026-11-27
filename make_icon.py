@@ -45,8 +45,28 @@ def make():
     return img
 
 
+def make_splash(icon, w=420, h=260):
+    """exe 시작 그림: 실행 파일을 더블클릭하자마자 (압축을 푸는 동안) 화면 가운데에 보여 줌
+    → 프로그램 창이 뜨면 닫힘 (pyi_splash)"""
+    from PIL import ImageFont
+    img = Image.new("RGB", (w, h), (243, 243, 243))
+    d = ImageDraw.Draw(img)
+    d.rectangle((0, 0, w - 1, h - 1), outline=(200, 200, 200))
+    ic = icon.resize((112, 112), Image.LANCZOS)
+    img.paste(ic, ((w - 112) // 2, 52), ic)
+    try:
+        font = ImageFont.truetype("malgun.ttf", 17)
+    except OSError:
+        font = ImageFont.load_default()
+    text = "CaptureDeck 시작 중..."
+    tw = d.textlength(text, font=font)
+    d.text(((w - tw) / 2, 186), text, fill=(27, 27, 27), font=font)
+    return img
+
+
 if __name__ == "__main__":
     img = make()
     img.save("capturedeck.ico", sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
     img.resize((256, 256), Image.LANCZOS).save("capturedeck.png")
+    make_splash(img).save("capturedeck_splash.png")
     print("ok")
