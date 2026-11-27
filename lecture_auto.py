@@ -214,6 +214,7 @@ class AutoRecorder(threading.Thread):
     강의를 차례로 재생하며 녹화. 녹화 시작/중지는 hooks로 프로그램 본체에 맡김.
     hooks: start_rec(name) -> bool, stop_rec(), is_busy() -> bool,
            status(i, text), log(text), finished(summary)   (모두 이 스레드에서 호출 → 본체가 메인 스레드로 넘김)
+           (선택) skip(i) -> bool, length(i, 영상 길이 초), progress(i, 재생 위치 초, 영상 길이 초)
     """
 
     def __init__(self, lectures, hooks, gap=5, tries=3):
@@ -465,9 +466,12 @@ class AutoRecorder(threading.Thread):
             if s["done"] or s["ended"] or (s["dur"] and s["t"] >= s["dur"] - 0.02):
                 break
             last_t = s["t"]
-            left = max(0, int(dur - last_t))
-            st(f"녹화 중 {int(last_t) // 60}:{int(last_t) % 60:02d} / {int(dur) // 60}:{int(dur) % 60:02d}"
-               f" (남은 {left // 60}분 {left % 60}초)")
+            if "progress" in self.h:  # 진행률·남은 시간은 본체가 표시
+                self.h["progress"](i, last_t, dur)
+            else:
+                left = max(0, int(dur - last_t))
+                st(f"녹화 중 {int(last_t) // 60}:{int(last_t) % 60:02d} / {int(dur) // 60}:{int(dur) % 60:02d}"
+                   f" (남은 {left // 60}분 {left % 60}초)")
             if not s["paused"] and not rate_fixed and s["rate"] != 1:
                 ps.eval(RATE_JS)  # 플레이어가 예전 배속을 되살린 경우
                 rate_fixed = True

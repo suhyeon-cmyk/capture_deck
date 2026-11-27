@@ -67,9 +67,13 @@ DEFAULTS = {
     "auto_geometry": "", "auto_zoomed": False,  # 자동 녹화 화면의 창 크기·위치 (직접 녹화와 따로 기억)
     # 용량 줄이기 (자르기 탭의 '용량 줄이기 설정으로 저장'도 이 설정을 씀)
     "auto_list": "", "auto_gap": "5",  # 자동 녹화: 강의 목록(줄바꿈은 \n으로 저장), 강의 사이 쉬는 시간
-    # 자동 녹화 후 용량 줄이기: 사용 여부, 시점, 화질/해상도/프레임/GPU, 줄인 뒤 원본 삭제
-    "auto_enc": False, "auto_enc_when": "모든 강의 녹화가 끝난 뒤", "auto_enc_quality": "보통 (추천)",
+    # 자동 녹화 작업: 진행 방식(each 녹화 완료 후 바로 인코딩 / all 모든 녹화 후 / rec 녹화만), 인코딩 완료 후 원본 제거
+    # (auto_enc·auto_enc_when은 예전 설정 - auto_flow가 비어 있을 때 한 번 읽음)
+    "auto_flow": "", "auto_enc": False, "auto_enc_when": "", "auto_enc_quality": "보통 (추천)",
     "auto_enc_res": "원본", "auto_enc_fps": "30fps", "auto_enc_gpu": False, "auto_enc_delete": False,
+    "auto_enc_speed_cpu": "", "auto_enc_speed_gpu": "",  # 지난 인코딩에서 잰 속도 (남은 시간 계산용)
+    # 자동 녹화 파일 이름: 공백(keep 그대로 / remove 제거 / under '_'로), 영상 길이(분) 넣기
+    "auto_name_space": "keep", "auto_name_len": False,
     "enc_quality": "보통 (추천)", "enc_res": "원본", "enc_fps": "30fps", "enc_gpu": False, "trim_compress": True,
 }
 
@@ -404,10 +408,71 @@ def mux_to_mp4(vid, wav, out, progress=None):
     return ok, ("".join(err) if not ok else ""), cmd
 
 
-def unique_base(out_dir, name):
+# ---- 녹화 파일 이름
+# 직접 녹화: 'capture_날짜_시각.tmp.mkv' + '.tmp.wav' → 'capture_날짜_시각.mp4'
+# 자동 녹화: '제 1 강_제목(녹화중).mkv' + '(녹화중).wav' → 합치기 끝 '(원본).mp4' → 인코딩 끝 '제 1 강_제목.mp4'
+REC_TAG, RAW_TAG = "(녹화중)", "(원본)"
+NAME_SPACE = (("keep", "공백 그대로"), ("remove", "공백 제거"), ("under", "공백을 '_'로 채우기"))
+_BAD_NAME_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+
+
+def rec_paths(base, auto=False):
+    """녹화 base(확장자 없음) → (영상 임시 파일, 소리 임시 파일, 합친 MP4)"""
+    if auto:
+        return base + REC_TAG + ".mkv", base + REC_TAG + ".wav", base + RAW_TAG + ".mp4"
+    return base + ".tmp.mkv", base + ".tmp.wav", base + ".mp4"
+
+
+def lecture_stem(no, title, space="keep", mins=None):
+    """강의 → 파일 이름 ('제 1 강_강의 제목', 꼬리표·확장자 없음)
+    파일 이름에 쓸 수 없는 글자는 항상 빼고, 공백은 설정대로 (그대로 / 제거 / '_'), mins를 주면 '_48분'을 붙임"""
+    title = " ".join(_BAD_NAME_CHARS.sub(" ", title or "").split())[:80].strip(" .")
+    name = f"제 {no} 강" + (f"_{title}" if title else "") + (f"_{mins}분" if mins else "")
+    if space == "remove":
+        name = name.replace(" ", "")
+    elif space == "under":
+        name = name.replace(" ", "_")
+    return name
+
+
+def scan_lecture_files(out_dir, no, extra=()):
+    """저장 폴더에서 이 강의(제 N 강)의 MP4를 찾음 (이름 형식이 바뀌었어도 '제 N 강'으로 시작하면 찾음)
+    → (녹화 원본 [(경로, 정보)], 인코딩한 파일 [(경로, 정보)])  - 최근 파일이 앞. 다른 스레드에서 호출"""
+    pat = re.compile(rf"^제[ _]*{int(no)}[ _]*강")
+    cands = {}
+    try:
+        names = os.listdir(out_dir)
+    except OSError:
+        names = []
+    for n in names:
+        low = n.lower()
+        if pat.match(n) and low.endswith(".mp4") and not low.endswith(".part.mp4"):
+            p = os.path.normpath(os.path.join(out_dir, n))
+            cands[os.path.normcase(p)] = p
+    for p in extra:
+        if p and os.path.isfile(p):
+            cands[os.path.normcase(os.path.normpath(p))] = os.path.normpath(p)
+    raw, enc = [], []
+    for p in cands.values():
+        info = media_info(p)
+        name = os.path.basename(p)
+        if name.endswith(RAW_TAG + ".mp4"):
+            raw.append((p, info))
+        elif is_encoded(info) or re.search(r"_small\d*\.mp4$", name, re.I):
+            enc.append((p, info))
+        else:
+            raw.append((p, info))  # 예전 이름('제 1 강.mp4')의 녹화 원본
+
+    def newest(lst):
+        return sorted(lst, key=lambda x: os.path.getmtime(x[0]) if os.path.exists(x[0]) else 0, reverse=True)
+    return newest(raw), newest(enc)
+
+
+def unique_base(out_dir, name, auto=False):
     """out_dir/name (확장자 없음). 같은 이름의 녹화·임시 파일이 있으면 'name (2)', 'name (3)'..."""
     def taken(b):
-        return any(os.path.exists(b + ext) for ext in (".mp4", ".part.mp4", ".tmp.mkv", ".tmp.wav"))
+        vid, wav, out = rec_paths(b, auto)
+        return any(os.path.exists(p) for p in (vid, wav, out, os.path.splitext(out)[0] + ".part.mp4", b + ".mp4"))
     base = os.path.join(out_dir, name)
     n = 2
     while taken(base):
@@ -1170,6 +1235,7 @@ class RecoverPanel(ttk.Frame):
         self.on_idle = on_idle        # 복구 작업이 모두 끝났을 때 호출
         self.busy = False
         self.scan_id = 0
+        self.items = {}  # 영상 임시 파일 경로 → (영상, 소리, 만들 MP4, 이름 base)
         self._build()
 
     def _build(self):
@@ -1187,7 +1253,8 @@ class RecoverPanel(ttk.Frame):
         ttk.Button(top, text="폴더 열기", command=self.open_dir).pack(side="left")
 
         ttk.Label(self, foreground="#555", justify="left", text=(
-            "녹화 중 프로그램이 꺼지거나 MP4 변환이 실패하면 영상(.tmp.mkv)과 소리(.tmp.wav)가 따로 남아요. "
+            "녹화 중 프로그램이 꺼지거나 MP4 변환이 실패하면 영상(.tmp.mkv / (녹화중).mkv)과 "
+            "소리(.tmp.wav / (녹화중).wav)가 따로 남아요. "
             "여기서 다시 하나의 MP4로 합칠 수 있어요.\n"
             "기존 MP4가 깨져 있으면 복구한 파일로 바꾸고, 정상이면 '_복구.mp4'로 따로 저장해요.")
         ).pack(fill="x", padx=8, pady=(0, 6))
@@ -1262,23 +1329,28 @@ class RecoverPanel(ttk.Frame):
             self.lbl_status.config(text="폴더를 찾을 수 없어요.")
             return
         active = self.get_active()
+        self.items = {}
         bases = []
         for name in sorted(os.listdir(d), reverse=True):  # 최근 녹화가 위로
-            if not name.lower().endswith(".tmp.mkv"):
+            if name.lower().endswith(".tmp.mkv"):  # 직접 녹화
+                base, auto = os.path.join(d, name[:-len(".tmp.mkv")]), False
+            elif name.endswith(REC_TAG + ".mkv"):  # 자동 녹화 ('제 1 강_제목(녹화중).mkv')
+                base, auto = os.path.join(d, name[:-len(REC_TAG + ".mkv")]), True
+            else:
                 continue
-            base = os.path.join(d, name[:-len(".tmp.mkv")])
-            if active and os.path.normcase(base) == os.path.normcase(active):
+            vid, wav, mp4 = rec_paths(base, auto)
+            if active and os.path.normcase(vid) == os.path.normcase(active):
                 continue  # 지금 녹화/변환 중인 파일
             m = re.search(r"(\d{8})_(\d{6})$", base)
             when = (datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S").strftime("%Y-%m-%d %H:%M:%S")
-                    if m else "")
-            wav = base + ".tmp.wav"
-            size = os.path.getsize(base + ".tmp.mkv") + (os.path.getsize(wav) if os.path.exists(wav) else 0)
-            self.tree.insert("", "end", iid=base, values=(
+                    if m else datetime.fromtimestamp(os.path.getmtime(vid)).strftime("%Y-%m-%d %H:%M:%S"))
+            size = os.path.getsize(vid) + (os.path.getsize(wav) if os.path.exists(wav) else 0)
+            self.items[vid] = (vid, wav, mp4, base)
+            self.tree.insert("", "end", iid=vid, values=(
                 os.path.basename(base), when, "확인 중...", fmt_size(size),
                 "있음" if os.path.exists(wav) else "없음",
-                "확인 중..." if os.path.exists(base + ".mp4") else "없음", "복구 대기"))
-            bases.append(base)
+                "확인 중..." if os.path.exists(mp4) else "없음", "복구 대기"))
+            bases.append(vid)
         self.lbl_status.config(text=f"복구할 수 있는 녹화 {len(bases)}개" if bases
                                else "복구할 녹화가 없어요. (남아 있는 임시 파일 없음)")
         if bases:
@@ -1286,14 +1358,15 @@ class RecoverPanel(ttk.Frame):
 
     def _probe_all(self, scan_id, bases):
         """길이와 기존 MP4가 열리는지 확인 (오래 걸릴 수 있어 별도 스레드)"""
-        for base in bases:
+        for key in bases:
             if scan_id != self.scan_id:
                 return
-            dur = probe_media(base + ".tmp.mkv")[1]
-            self._ui(self._set, base, "len", fmt_secs(dur) if dur else "알 수 없음")
-            if os.path.exists(base + ".mp4"):
-                ok = probe_media(base + ".mp4")[0]
-                self._ui(self._set, base, "mp4", "정상" if ok else "깨짐 (열리지 않음)")
+            vid, wav, mp4, base = self.items[key]
+            dur = probe_media(vid)[1]
+            self._ui(self._set, key, "len", fmt_secs(dur) if dur else "알 수 없음")
+            if os.path.exists(mp4):
+                ok = probe_media(mp4)[0]
+                self._ui(self._set, key, "mp4", "정상" if ok else "깨짐 (열리지 않음)")
 
     # ---- 복구
     def recover_selected(self):
@@ -1318,27 +1391,28 @@ class RecoverPanel(ttk.Frame):
     def _run(self, bases, delete_tmp):
         done = 0
         n = len(bases)
-        for i, base in enumerate(bases):
-            vid, wav, mp4 = base + ".tmp.mkv", base + ".tmp.wav", base + ".mp4"
+        for i, key in enumerate(bases):
+            vid, wav, mp4, base = self.items[key]
             if not os.path.exists(vid):
-                self._ui(self._set, base, "state", "영상 파일이 없어요")
+                self._ui(self._set, key, "state", "영상 파일이 없어요")
                 continue
             name = os.path.basename(base)
-            self._ui(self._set, base, "state", "복구 중...")
+            self._ui(self._set, key, "state", "복구 중...")
             self._ui(self.lbl_status.config, {"text": f"복구 중 ({i + 1}/{n}): {name}"})
             out = mp4
             if os.path.exists(mp4) and probe_media(mp4)[0]:  # 정상 MP4는 덮어쓰지 않음
-                out, k = base + "_복구.mp4", 2
+                stem = os.path.splitext(mp4)[0]
+                out, k = stem + "_복구.mp4", 2
                 while os.path.exists(out):
-                    out, k = f"{base}_복구{k}.mp4", k + 1
+                    out, k = f"{stem}_복구{k}.mp4", k + 1
 
-            def progress(sec, total, base=base, i=i):
+            def progress(sec, total, key=key, i=i):
                 if total:
                     pct = min(100.0, sec / total * 100)
-                    self._ui(self._set, base, "state", f"복구 중... {pct:.0f}%")
+                    self._ui(self._set, key, "state", f"복구 중... {pct:.0f}%")
                     self._ui(self.prog.config, {"value": (i + pct / 100) / n * 100})
                 else:
-                    self._ui(self._set, base, "state", f"복구 중... {fmt_secs(sec)}")
+                    self._ui(self._set, key, "state", f"복구 중... {fmt_secs(sec)}")
 
             ok, err, cmd = mux_to_mp4(vid, wav if os.path.exists(wav) else None, out, progress)
             if ok:
@@ -1349,11 +1423,11 @@ class RecoverPanel(ttk.Frame):
                             os.remove(f)
                         except OSError:
                             pass
-                self._ui(self._set, base, "state", f"완료 → {os.path.basename(out)}")
-                self._ui(self._set, base, "mp4", "정상")
+                self._ui(self._set, key, "state", f"완료 → {os.path.basename(out)}")
+                self._ui(self._set, key, "mp4", "정상")
             else:
                 write_mux_log(base, cmd, err)
-                self._ui(self._set, base, "state", f"실패 (원인: {name}.log)")
+                self._ui(self._set, key, "state", f"실패 (원인: {name}.log)")
         self._ui(self._finish, done, n)
 
     def _finish(self, done, n):
@@ -1383,9 +1457,11 @@ class EncodePanel(ttk.Frame):
         self.worker = None
         self.current = None
         self.removed = set()    # 인코딩 중 목록에서 뺀 항목 (건너뜀)
-        self.auto_items = {}    # 자동 녹화에서 보낸 파일 → (설정, 끝나면 원본 삭제 여부)
-        self.on_auto_done = None  # 자동 항목이 끝날 때마다 호출 (경로, 결과 문구)
-        self.on_auto_progress = None  # 자동 항목의 상태가 바뀔 때마다 호출 (경로, 상태 문구)
+        # 자동 녹화에서 보낸 파일 → 설정을 돌려주는 함수 () -> (설정, 끝나면 원본 삭제 여부, 만들 파일 경로)
+        # (그 파일을 시작할 때 불러서, 작업 중에 바꾼 설정은 다음 파일부터 적용)
+        self.auto_items = {}
+        self.on_auto_done = None      # 자동 항목이 끝날 때 (경로, 결과 ok/fail/stopped/missing, 만든 파일, 문구, 속도)
+        self.on_auto_progress = None  # 자동 항목 진행 (경로, 진행률 %, 남은 초 또는 None)
         self.paused = threading.Event()  # 일시중지 중 (다음 파일도 시작하지 않음)
         self._build()
         threading.Thread(target=self._check_gpu, daemon=True).start()
@@ -1465,8 +1541,23 @@ class EncodePanel(ttk.Frame):
     def _set(self, iid, col, text):
         if self.tree.exists(iid):
             self.tree.set(iid, col, text)
-        if col == "state" and iid in self.auto_items and self.on_auto_progress:
-            self.on_auto_progress(iid, text)
+
+    def _main(self, fn):
+        """작업 스레드에서 메인 스레드 함수를 실행하고 결과를 기다림"""
+        box, ev = [], threading.Event()
+
+        def run():
+            try:
+                box.append(fn())
+            finally:
+                ev.set()
+        self._ui(run)
+        ev.wait(30)
+        return box[0] if box else None
+
+    def _auto_progress(self, src, pct, left):
+        if src in self.auto_items and self.on_auto_progress:
+            self.on_auto_progress(src, pct, left)
 
     def _check_gpu(self):
         ok = nvenc_available()
@@ -1506,21 +1597,41 @@ class EncodePanel(ttk.Frame):
             self.lbl_status.config(text=f"{len(new)}개 추가했어요. 설정을 고른 뒤 '용량 줄이기 시작'을 누르세요.")
             threading.Thread(target=self._probe, args=(new,), daemon=True).start()
 
-    def enqueue(self, paths, opts, delete_src):
-        """자동 녹화가 끝난 파일을 지정한 설정으로 줄이기 (인코딩 중이면 지금 작업이 끝난 뒤 이어서)"""
-        paths = [os.path.normpath(p) for p in paths if os.path.isfile(p)]
-        for p in paths:
-            self.auto_items[p] = (opts, delete_src)
+    def enqueue(self, items):
+        """자동 녹화가 보낸 파일 [(경로, 설정 함수)]을 줄이기 (인코딩 중이면 지금 작업이 끝난 뒤 이어서)"""
+        paths = []
+        for p, getter in items:
+            p = os.path.normpath(p)
+            if not os.path.isfile(p):
+                continue
+            self.auto_items[p] = getter
+            self.removed.discard(p)
+            if self.tree.exists(p) and not (self.busy and p == self.current):
+                self.tree.set(p, "state", "대기")  # 전에 중지·실패한 항목도 다시
+            paths.append(p)
         self.add_files(paths)
         if not self.busy:
             self.start(only_waiting=True)
+
+    def drop_auto(self):
+        """자동 녹화가 보낸 것 중 아직 시작하지 않은 파일을 목록에서 뺌 (작업 중지) → 뺀 경로(normcase) 집합"""
+        dropped = set()
+        for p in list(self.auto_items):
+            if self.busy and p == self.current:
+                continue
+            self.auto_items.pop(p, None)
+            self.removed.add(p)
+            dropped.add(os.path.normcase(p))
+            if self.tree.exists(p):
+                self.tree.delete(p)
+        return dropped
 
     def _probe(self, paths):
         for p in paths:
             info = media_info(p)
             self.info[p] = info
             self._ui(self._set, p, "len", fmt_secs(info["dur"]) if info["dur"] else "알 수 없음")
-            if not info["ok"]:
+            if not info["ok"] and p not in self.auto_items:  # 자동 항목은 인코딩하면서 실패로 알림
                 self._ui(self._set, p, "state", "열 수 없는 파일")
 
     def remove_selected(self):
@@ -1587,13 +1698,19 @@ class EncodePanel(ttk.Frame):
                 continue
             if not os.path.isfile(src):
                 self._ui(self._set, src, "state", "파일이 없어요")
+                if src in self.auto_items:
+                    self._ui(self._auto_done, src, "missing")
                 failed += 1
                 continue
             self.current = src
             info = self.info.get(src) or media_info(src)
             self.info[src] = info
-            item_opts, delete_src = self.auto_items.get(src, (opts, False))
-            out = self._out_path(src)
+            getter = self.auto_items.get(src)
+            job = self._main(getter) if getter else None
+            item_opts, delete_src, want = job or (opts, False, None)
+            # 자동 녹화: '제 1 강_제목(원본).mp4' → '제 1 강_제목.mp4' (그 이름이 이미 있으면 '_small')
+            out = want if (want and os.path.normcase(want) != os.path.normcase(src)
+                           and not os.path.exists(want)) else self._out_path(src)
             part = os.path.splitext(out)[0] + ".part.mp4"
             cmd = ([imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-loglevel", "error", "-progress", "pipe:1",
                     "-i", src, "-map", "0:v:0", "-map", "0:a?"]
@@ -1601,6 +1718,7 @@ class EncodePanel(ttk.Frame):
             name = os.path.basename(src)
             self._ui(self.lbl_status.config, {"text": f"줄이는 중 ({i + 1}/{n}): {name}"})
             self._ui(self._set, src, "state", "인코딩 중...")
+            self._ui(self._auto_progress, src, 0.0, None)
             err = []
             t0 = time.time()
             try:
@@ -1618,6 +1736,7 @@ class EncodePanel(ttk.Frame):
                             left = (now - t0) / pct * (100 - pct) if pct > 1 else None
                             eta = f" (남은 시간 약 {fmt_secs(left)})" if left else ""
                             self._ui(self._set, src, "state", f"인코딩 중 {pct:.0f}%{eta}")
+                            self._ui(self._auto_progress, src, pct, left)
                             self._ui(self.prog.config, {"value": (i + pct / 100) / n * 100})
                 ok = p.wait() == 0 and os.path.exists(part) and not self.stop_flag.is_set()
                 et.join(5)
@@ -1634,6 +1753,8 @@ class EncodePanel(ttk.Frame):
                     pass
             if self.stop_flag.is_set():
                 self._ui(self._set, src, "state", "중지됨")
+                if src in self.auto_items:
+                    self._ui(self._auto_done, src, "stopped")
                 break
             if ok:
                 done += 1
@@ -1641,21 +1762,26 @@ class EncodePanel(ttk.Frame):
                 before, after = before + a, after + b
                 self._ui(self._set, src, "out", f"{fmt_size(b)} ({b / a * 100:.0f}%)")
                 state = f"완료 → {os.path.basename(out)}"
-                if delete_src:  # 원본은 휴지통으로, 줄인 파일이 원본 이름을 이어받음
+                if delete_src:  # 원본은 휴지통으로
                     if to_recycle_bin(src):
-                        os.replace(out, src)
-                        state = f"완료 → {os.path.basename(src)} (원본은 휴지통으로)"
+                        # 원하던 이름이 원본과 같았거나 비어 있으면 그 이름을 이어받음
+                        target = want or src
+                        if os.path.normcase(target) != os.path.normcase(out) and not os.path.exists(target):
+                            os.replace(out, target)
+                            out = target
+                        state = f"완료 → {os.path.basename(out)} (원본은 휴지통으로)"
                     else:
                         state += " (원본 삭제 실패)"
                 self._ui(self._set, src, "state", state)
                 if src in self.auto_items:
-                    self._ui(self._auto_done, src, state)
+                    speed = (time.time() - t0) / info["dur"] if info["dur"] else None
+                    self._ui(self._auto_done, src, "ok", out, state, speed)
             else:
                 failed += 1
                 msg = " ".join("".join(err).split())[:80] or "알 수 없는 오류"
                 self._ui(self._set, src, "state", f"실패: {msg}")
                 if src in self.auto_items:
-                    self._ui(self._auto_done, src, f"실패: {msg}")
+                    self._ui(self._auto_done, src, "fail", None, msg)
         self._ui(self._finish, done, failed, before, after)
 
     def _finish(self, done, failed, before, after):
@@ -1678,10 +1804,11 @@ class EncodePanel(ttk.Frame):
         if not self.stop_flag.is_set():  # 인코딩 중에 자동 녹화가 보낸 파일이 있으면 이어서
             self.after(500, self.start, True)
 
-    def _auto_done(self, src, state):
-        self.auto_items.pop(src, None)
+    def _auto_done(self, src, result, out=None, msg="", speed=None):
+        if self.auto_items.pop(src, None) is None:
+            return
         if self.on_auto_done:
-            self.on_auto_done(src, state)
+            self.on_auto_done(src, result, out, msg, speed)
 
     def pause(self, on):
         """용량 줄이기 일시중지/다시 시작 (지금 인코딩 중인 ffmpeg도 멈춤)"""
@@ -1723,15 +1850,6 @@ class EncodePanel(ttk.Frame):
 
 
 # ---------------------------------------------------------------- 메인 앱
-def enc_state(text):
-    """용량 줄이기 진행 문구 → 강의 표의 상태 (인코딩 대기 / 인코딩 중 35% / 인코딩 완료 / 인코딩 실패: ...)"""
-    if text.startswith("인코딩"):
-        return text
-    if text.startswith("완료"):
-        return "인코딩 완료"
-    return "인코딩 " + text
-
-
 class TreeTip:
     """표 칸에 마우스를 올리면 그 칸의 글자 전체를 툴팁으로 보여줌 (잘려 보이는 긴 상태·제목용)"""
 
@@ -1783,55 +1901,106 @@ class TreeTip:
 class NoAuto:
     """직접 녹화 모드: 자동 녹화가 없음 (App이 자동 녹화 상태를 물어볼 때 쓰는 빈 객체)"""
     running = False
+    runner = None
     stopped = False
 
     def save(self):
         pass
 
-    def on_saved(self, path):
+    def on_saved(self, path, ok=True):
         pass
 
     def stop(self):
         pass
 
-    def _encoded(self, src, state):
+    def _encoded(self, *args, **kw):
         pass
 
 
-class AutoPanel(ttk.Frame):
-    """온라인 강의 연속 자동 녹화 화면: 위 안내 줄 / 왼쪽 미리보기·장치·용량 줄이기·시작 / 오른쪽 강의 표"""
+# ---- 자동 녹화 강의 표: 작업·상태
+TASKS = ("녹화", "인코딩", "녹화 및 인코딩", "건너뛰기")
+DEFAULT_TASK = "녹화 및 인코딩"
+# 상태 변경 콤보박스 (녹화 중·인코딩 중은 작업이 진행되면 저절로 바뀜)
+STATE_CHOICES = (("녹화 대기", "rec_wait"), ("녹화 중", "rec"), ("녹화 완료", "rec_done"),
+                 ("인코딩 대기", "enc_wait"), ("인코딩 중", "enc"), ("인코딩 완료", "enc_done"),
+                 ("건너뛰기", "skip"))
+STATE_FIXED = {
+    "rec_wait": "녹화 대기", "rec_done": "녹화 완료", "enc_wait": "인코딩 대기", "enc_done": "인코딩 완료",
+    "skip": "사용자가 해당 강의의 작업을 진행하지 않도록 상태를 변경했습니다.",
+    "missing": "파일이 존재하지 않습니다.",
+    "rec_stopped": "사용자가 녹화 도중 작업을 중지했습니다.",
+    "enc_stopped": "사용자가 인코딩 도중 작업을 중지했습니다.",
+}
+ALL_STATES = set(STATE_FIXED) | {"rec", "enc", "rec_fail", "enc_fail"}
+REC_NEED = ("rec_wait", "rec_stopped", "rec_fail", "missing")    # 작업에 '녹화'가 있으면 녹화할 상태
+ENC_NEED = ("rec_done", "enc_wait", "enc_stopped", "enc_fail")   # 작업에 '인코딩'이 있으면 인코딩할 상태
+# 녹화 뒤 인코딩 진행 방식 (작업 도중 바꾸면 다음 파일부터 적용)
+FLOWS = (("each", "녹화 완료 후 바로 인코딩"), ("all", "모든 녹화가 완료된 후 인코딩"), ("rec", "녹화만 진행"))
+LECTURE_OVERHEAD = 30  # 강의마다 창 열기·전체화면·저장에 드는 시간 (초, 남은 시간 계산용)
 
-    COLS = (("no", "일련번호", 64), ("title", "강의 제목", 230), ("len", "길이", 84), ("state", "상태", 150))
-    ENC_WHEN = ("모든 강의 녹화가 끝난 뒤", "강의마다 저장되면 바로")
+
+def has_rec(task):
+    return task in ("녹화", "녹화 및 인코딩")
+
+
+def has_enc(task):
+    return task in ("인코딩", "녹화 및 인코딩")
+
+
+def fmt_hm(secs):
+    secs = max(0, int(secs))
+    h, m = secs // 3600, (secs % 3600 + 59) // 60
+    if m == 60:
+        h, m = h + 1, 0
+    return f"{h}시간 {m}분" if h else f"{m}분"
+
+
+def fmt_clock(t, now):
+    days = (t.date() - now.date()).days
+    day = "" if days <= 0 else "내일 " if days == 1 else f"{t:%m/%d} "
+    return f"{day}{t:%H:%M}"
+
+
+class AutoPanel(ttk.Frame):
+    """온라인 강의 연속 자동 녹화 화면: 위 안내 줄 / 왼쪽 미리보기·장치·파일 이름·인코딩 설정 / 오른쪽 강의 표·작업"""
+
+    COLS = (("no", "일련번호", 64), ("title", "강의 제목", 200), ("len", "길이", 84),
+            ("task", "작업", 100), ("state", "상태", 300))
 
     def __init__(self, master, app):
         super().__init__(master)
         self.app = app
-        self.runner = None
-        self.rows = {}       # 표 행 → 강의 {idx, no, title, mins}
-        self.run_rows = []   # 이번 실행에서 녹화할 표 행 (AutoRecorder 순번 → 행)
-        self.saved = []      # 이번 자동 녹화에서 저장된 파일 (끝난 뒤 한꺼번에 줄일 때)
-        self.muxed = set()      # MP4 변환이 끝난 파일
-        self.completed = set()  # 끝까지 녹화를 마친 표 행 (이 둘이 맞아야 용량 줄이기로 보냄)
-        self.rec_files = {}  # 표 행 → 그 강의를 녹화한 MP4 경로
-        self.cur_row = None  # 지금 진행 중인 표 행
-        self.stopped = False  # 사용자가 '중지'를 눌렀는지 (그러면 컴퓨터를 끄지 않음)
+        self.runner = None     # 녹화하는 AutoRecorder (녹화가 끝나면 None, 인코딩은 계속될 수 있음)
+        self.session = False   # '작업 시작'부터 녹화·인코딩이 모두 끝날 때까지
+        self.rows = {}         # 표 행 → {idx, no, title, mins, st, note, task, len, raw, enc, pct, left}
+        self.run_rows = []     # 이번 실행에서 녹화할 표 행 (AutoRecorder 순번 → 행)
+        self.muxed = set()     # MP4 합치기가 끝난 파일 (normcase)
+        self.completed = set() # 끝까지 녹화를 마친 표 행 (합치기도 끝나야 확인 → 인코딩)
+        self.enc_sent = {}     # 인코딩으로 보낸 표 행 → 원본 경로(normcase)
+        self.verifying = 0     # 파일 확인 중인 개수
+        self.cur_row = None    # 지금 녹화 중인 표 행
+        self.stopped = False   # 사용자가 '중지'를 눌렀는지 (그러면 컴퓨터를 끄지 않음)
+        self.counts = {}       # 이번 작업 결과 (녹화 완료/인코딩 완료/실패 개수)
         self._build()
         self._load_rows()
         self.after(1500, self._startup_check)
+        self.after(1000, self._tick)
 
     @property
     def running(self):
-        return self.runner is not None
+        """App이 묻는 '자동 작업 중' (녹화 또는 인코딩)"""
+        return self.session
 
+    # ------------------------------------------------------------ 화면
     def _build(self):
+        cfg = self.app.cfg
         # 위: 순서 안내
         top = ttk.Frame(self, padding=(10, 10, 10, 0))
         top.pack(fill="x")
         self.btn_edge = ttk.Button(top, text="① 자동녹화용 Edge 열기", command=self.app.open_edge)
         self.btn_edge.pack(side="left")
         for text in ("②  그 Edge에서 로그인 › 나의 강의실 › 강좌를 눌러 강의 목록 펼치기",
-                     "③  LESSON 추가", "④  자동 녹화 시작"):
+                     "③  LESSON 추가", "④  작업 시작"):
             ttk.Label(top, text="→", style="Hint.TLabel").pack(side="left", padx=8)
             ttk.Label(top, text=text).pack(side="left")
 
@@ -1844,10 +2013,10 @@ class AutoPanel(ttk.Frame):
 
         body = ttk.Frame(self)
         body.pack(fill="both", expand=True)
-        # 오른쪽: 녹화할 강의 표 + 실행
+        # 오른쪽: 강의 표 + 작업
         right = ttk.Frame(body)
         right.pack(side="right", fill="y", padx=(0, 10), pady=10)
-        lf = ttk.LabelFrame(right, text="녹화할 강의", style="Section.TLabelframe", padding=(8, 6, 8, 8))
+        lf = ttk.LabelFrame(right, text="강의 목록", style="Section.TLabelframe", padding=(8, 6, 8, 8))
         lf.pack(fill="both", expand=True)
         tf = ttk.Frame(lf)
         tf.pack(fill="both", expand=True)
@@ -1863,77 +2032,111 @@ class AutoPanel(ttk.Frame):
         self.tree.bind("<Delete>", lambda e: self.remove_selected())
         self.tree.bind("<Button-3>", self._popup)
         TreeTip(self.tree, ("title", "state"))  # 잘려 보이는 상태·제목 전체를 툴팁으로
-        rb = ttk.Frame(lf)
-        rb.pack(fill="x", pady=(8, 0))
-        self.btn_add = ttk.Button(rb, text="+ LESSON 추가", command=self.add_dialog)
-        self.btn_add.pack(side="left")
+
+        # 오른쪽 클릭: 작업 변경 / 상태 변경 / 파일 열기 / 삭제
         self.menu = tk.Menu(self, tearoff=0)
-        self.menu.add_command(label="다시 녹화하기 (대기로)", command=lambda: self.set_state("대기 (다시 녹화)"))
-        self.menu.add_command(label="완료로 표시 (녹화 안 함)", command=lambda: self.set_state("완료 (직접 표시)"))
-        self.menu.add_command(label="인코딩 대기 (용량 줄이기)", command=self.encode_selected)
+        for t in TASKS:
+            self.menu.add_command(label=f"작업: {t}", command=lambda t=t: self.set_task(t))
+        self.menu.add_separator()
+        sm = tk.Menu(self.menu, tearoff=0)
+        for name, code in STATE_CHOICES:
+            sm.add_command(label=name, command=lambda n=name: self.set_state(n),
+                           state="disabled" if code in ("rec", "enc") else "normal")
+        self.menu.add_cascade(label="상태 변경", menu=sm)
         self.menu.add_separator()
         self.menu.add_command(label="녹화 파일 열기", command=lambda: self.open_file(False))
         self.menu.add_command(label="폴더에서 보기", command=lambda: self.open_file(True))
         self.menu.add_separator()
         self.menu.add_command(label="표에서 삭제", command=self.remove_selected)
-        self.btn_state = ttk.Menubutton(rb, text="상태 변경", menu=self.menu)
-        self.btn_state.pack(side="left", padx=(6, 0))
+
+        rb = ttk.Frame(lf)
+        rb.pack(fill="x", pady=(8, 0))
+        self.btn_add = ttk.Button(rb, text="+ LESSON 추가", command=self.add_dialog)
+        self.btn_add.pack(side="left")
+        self.cb_state = ttk.Combobox(rb, values=[n for n, _ in STATE_CHOICES], state="readonly", width=11)
+        self.cb_state.set("상태 변경")
+        self.cb_state.bind("<<ComboboxSelected>>", self._on_state_combo)
+        self.cb_state.pack(side="left", padx=(6, 0))
         self.btn_check = ttk.Button(rb, text="상태 체크", command=self.check_files)
         self.btn_check.pack(side="left", padx=(6, 0))
         self.btn_del = ttk.Button(rb, text="선택 삭제", command=self.remove_selected)
         self.btn_del.pack(side="left", padx=(6, 0))
         self.btn_clear = ttk.Button(rb, text="모두 지우기", command=self.clear_rows)
         self.btn_clear.pack(side="left", padx=(6, 0))
-        self.lbl_total = ttk.Label(rb, text="", style="Hint.TLabel")
-        self.lbl_total.pack(side="right")
+        ttk.Label(rb, text="오른쪽 클릭: 작업 변경", style="Hint.TLabel").pack(side="right")
 
-        run = ttk.LabelFrame(right, text="자동 녹화", style="Section.TLabelframe", padding=(8, 6, 8, 8))
+        # 작업: 진행 방식 · 원본 제거 · 컴퓨터 종료 · 남은 시간 · 시작/중지
+        run = ttk.LabelFrame(right, text="작업", style="Section.TLabelframe", padding=(8, 6, 8, 8))
         run.pack(fill="x", pady=(10, 0))
-        self.btn_start = ttk.Button(run, text="▶  자동 녹화 시작", style="Big.TButton", command=self.start)
-        self.btn_start.pack(side="left")
-        self.btn_stop = ttk.Button(run, text="■  중지", style="Big.TButton", command=self.stop, state="disabled")
-        self.btn_stop.pack(side="left", padx=(6, 0))
-        ttk.Label(run, text="초").pack(side="right")
-        self.var_gap = tk.StringVar(value=str(self.app.cfg.get("auto_gap", "5")))
-        ttk.Spinbox(run, from_=0, to=600, textvariable=self.var_gap, width=4, justify="center"
-                    ).pack(side="right", padx=4)
-        ttk.Label(run, text="강의 사이 쉬는 시간").pack(side="right")
+        self.lbl_total = ttk.Label(run, text="", foreground="#1a5fb4")
+        self.lbl_total.pack(anchor="w")
+        r1 = ttk.Frame(run)
+        r1.pack(fill="x", pady=(6, 0))
+        flow = cfg.get("auto_flow")
+        if flow not in dict(FLOWS):  # 예전 설정 (자동으로 줄이기 + 시점)
+            flow = ("rec" if not cfg.get("auto_enc") else
+                    "each" if cfg.get("auto_enc_when") == "강의마다 저장되면 바로" else "all")
+        self.var_flow = tk.StringVar(value=flow)
+        for code, text in FLOWS:
+            ttk.Radiobutton(r1, text=text, value=code, variable=self.var_flow,
+                            command=self._on_option).pack(side="left", padx=(0, 12))
+        r2 = ttk.Frame(run)
+        r2.pack(fill="x", pady=(4, 0))
+        self.var_edel = tk.BooleanVar(value=bool(cfg.get("auto_enc_delete")))
+        ttk.Checkbutton(r2, text="인코딩 완료 후 원본파일 제거 (휴지통으로)", variable=self.var_edel,
+                        command=self._on_option).pack(side="left")
         # 매번 꺼진 상태로 시작 (켜 둔 채 잊고 다음에 쓰다가 컴퓨터가 꺼지지 않도록 저장하지 않음)
         self.var_shutdown = tk.BooleanVar(value=False)
-        ttk.Checkbutton(run, text="작업 완료 후 컴퓨터 종료", variable=self.var_shutdown
-                        ).pack(side="bottom", anchor="w", pady=(8, 0), before=self.btn_start)
+        ttk.Checkbutton(r2, text="작업 완료 후 컴퓨터 종료", variable=self.var_shutdown,
+                        command=self._on_option).pack(side="left", padx=(16, 0))
+        ttk.Label(run, text="작업 중에 바꾸면 다음 파일부터 적용돼요", style="Hint.TLabel").pack(anchor="w", pady=(2, 0))
+        r3 = ttk.Frame(run)
+        r3.pack(fill="x", pady=(8, 0))
+        self.btn_start = ttk.Button(r3, text="▶  작업 시작", style="Big.TButton", command=self.start)
+        self.btn_start.pack(side="left")
+        self.btn_stop = ttk.Button(r3, text="■  중지", style="Big.TButton", command=self.stop, state="disabled")
+        self.btn_stop.pack(side="left", padx=(6, 0))
+        ttk.Label(r3, text="초").pack(side="right")
+        self.var_gap = tk.StringVar(value=str(cfg.get("auto_gap", "5")))
+        ttk.Spinbox(r3, from_=0, to=600, textvariable=self.var_gap, width=4, justify="center"
+                    ).pack(side="right", padx=4)
+        ttk.Label(r3, text="강의 사이 쉬는 시간").pack(side="right")
 
-        # 왼쪽: 미리보기와 설정 탭은 App이 채움 (설정 탭 중 '용량 줄이기'는 build_encode)
+        # 왼쪽: 미리보기와 설정 탭은 App이 채움 (설정 탭 중 '파일 이름 · 인코딩'은 build_encode)
         self.left = ttk.Frame(body)
         self.left.pack(side="left", fill="both", expand=True)
 
     def build_encode(self, parent):
-        """녹화 후 용량 줄이기 설정 ('용량 줄이기' 탭과 같은 방식으로 다시 인코딩)"""
+        """파일 이름 형식 + 인코딩(용량 줄이기) 설정"""
         cfg = self.app.cfg
-        o = ttk.LabelFrame(parent, text="녹화 후 용량 줄이기", style="Section.TLabelframe", padding=(10, 4, 10, 8))
-        o.pack(fill="x", pady=(8, 0))
-        r0 = ttk.Frame(o)
-        r0.pack(fill="x", pady=2)
-        self.var_enc = tk.BooleanVar(value=bool(cfg.get("auto_enc")))
-        ttk.Checkbutton(r0, text="녹화한 영상을 자동으로 줄이기", variable=self.var_enc,
-                        command=self._enc_state).pack(side="left")
-        self.cb_when = ttk.Combobox(r0, values=self.ENC_WHEN, state="readonly", width=24)
-        self.cb_when.set(cfg.get("auto_enc_when") if cfg.get("auto_enc_when") in self.ENC_WHEN else self.ENC_WHEN[0])
-        self.cb_when.pack(side="left", padx=(16, 0))
-        ttk.Label(r0, text="'바로'는 녹화 중에 인코딩해요 (CPU면 녹화가 끊길 수 있어요)",
-                  style="Hint.TLabel").pack(side="left", padx=(10, 0))
+        nf = ttk.LabelFrame(parent, text="파일 이름", style="Section.TLabelframe", padding=(10, 4, 10, 8))
+        nf.pack(fill="x", pady=(8, 0))
+        n0 = ttk.Frame(nf)
+        n0.pack(fill="x", pady=2)
+        sp = cfg.get("auto_name_space")
+        self.var_space = tk.StringVar(value=sp if sp in dict(NAME_SPACE) else "keep")
+        for code, text in NAME_SPACE:
+            ttk.Radiobutton(n0, text=text, value=code, variable=self.var_space,
+                            command=self._name_preview).pack(side="left", padx=(0, 10))
+        self.var_namelen = tk.BooleanVar(value=bool(cfg.get("auto_name_len")))
+        ttk.Checkbutton(n0, text="파일 이름에 영상 길이 넣기 (분 단위)", variable=self.var_namelen,
+                        command=self._name_preview).pack(side="left", padx=(6, 0))
+        self.btn_rename = ttk.Button(n0, text="표의 파일 이름 일괄 변경", command=self.rename_files)
+        self.btn_rename.pack(side="right")
+        self.lbl_name = ttk.Label(nf, text="", style="Hint.TLabel", justify="left")
+        self.lbl_name.pack(anchor="w", pady=(2, 0))
 
+        o = ttk.LabelFrame(parent, text="인코딩 (용량 줄이기)", style="Section.TLabelframe", padding=(10, 4, 10, 8))
+        o.pack(fill="x", pady=(8, 0))
         r1 = ttk.Frame(o)
         r1.pack(fill="x", pady=2)
-        ttk.Label(r1, text="화질").pack(side="left", padx=(22, 6))
+        ttk.Label(r1, text="화질").pack(side="left", padx=(0, 6))
         self.var_eq = tk.StringVar(value=cfg.get("auto_enc_quality"))
         if self.var_eq.get() not in dict(ENC_QUALITY):
             self.var_eq.set(ENC_QUALITY[1][0])
-        self.enc_widgets = [self.cb_when]
         for name, _ in ENC_QUALITY:
-            rb = ttk.Radiobutton(r1, text=name, value=name, variable=self.var_eq)
-            rb.pack(side="left", padx=(0, 10))
-            self.enc_widgets.append(rb)
+            ttk.Radiobutton(r1, text=name, value=name, variable=self.var_eq,
+                            command=self._update_total).pack(side="left", padx=(0, 10))
         ttk.Label(r1, text="해상도").pack(side="left", padx=(10, 4))
         self.cb_eres = ttk.Combobox(r1, values=ENC_RES, state="readonly", width=7)
         self.cb_eres.set(cfg.get("auto_enc_res") if cfg.get("auto_enc_res") in ENC_RES else "원본")
@@ -1943,85 +2146,104 @@ class AutoPanel(ttk.Frame):
         self.cb_efps.set(cfg.get("auto_enc_fps") if cfg.get("auto_enc_fps") in ENC_FPS else "30fps")
         self.cb_efps.pack(side="left")
         self.var_egpu = tk.BooleanVar(value=bool(cfg.get("auto_enc_gpu")))
-        chk_gpu = ttk.Checkbutton(r1, text="GPU로 빠르게 (NVIDIA)", variable=self.var_egpu)
-        chk_gpu.pack(side="left", padx=(14, 0))
+        ttk.Checkbutton(r1, text="GPU로 빠르게 (NVIDIA)", variable=self.var_egpu,
+                        command=self._update_total).pack(side="left", padx=(14, 0))
+        ttk.Label(o, text="'녹화 완료 후 바로 인코딩'은 녹화 중에 인코딩해요 (CPU면 녹화가 끊길 수 있어요)",
+                  style="Hint.TLabel").pack(anchor="w", pady=(2, 0))
+        self._name_preview()
 
-        self.var_edel = tk.BooleanVar(value=bool(cfg.get("auto_enc_delete")))
-        chk_del = ttk.Checkbutton(o, text="줄인 뒤 원본은 휴지통으로  (줄인 파일이 '제 1 강.mp4' 이름을 이어받아요)",
-                                  variable=self.var_edel)
-        chk_del.pack(anchor="w", padx=(22, 0), pady=2)
-        self.enc_widgets += [self.cb_eres, self.cb_efps, chk_gpu, chk_del]
-        self._enc_state()
+    def _on_option(self):
+        """작업 설정을 바꿈 → 저장하고 (작업 중이면) 다음 파일부터 적용"""
+        self.save()
+        save_config(self.app.cfg)
+        self._pump()
+        self._update_total()
 
-    def _enc_state(self):
-        on = self.var_enc.get() and not self.running
-        for w in self.enc_widgets:
-            w.config(state=("readonly" if isinstance(w, ttk.Combobox) else "normal") if on else "disabled")
+    def _name_preview(self):
+        if not hasattr(self, "lbl_name"):
+            return
+        kids = self.tree.get_children()
+        r = self.rows[kids[0]] if kids else {"no": 1, "title": "강의 제목", "mins": 48}
+        mins = None
+        if self.var_namelen.get():
+            exp = self._expected(r.get("len", ""), r)[0] if kids else 48 * 60
+            mins = max(1, round(exp / 60)) if exp else None
+        stem = lecture_stem(r["no"], r["title"], self.var_space.get(), mins)
+        self.lbl_name.config(text=f"녹화 중: {stem}{REC_TAG}.mkv / .wav   →   합친 뒤: {stem}{RAW_TAG}.mp4"
+                                  f"   →   인코딩 뒤: {stem}.mp4")
+        self.save()
 
     def enc_options(self):
         """(화질, 해상도, 프레임, GPU) - GPU를 골랐어도 쓸 수 없으면 CPU로"""
         gpu = bool(self.var_egpu.get()) and self.app.encode.gpu_ok
         return self.var_eq.get(), self.cb_eres.get(), self.cb_efps.get(), gpu
 
-    def on_saved(self, path):
-        """자동 녹화 강의 하나가 MP4로 저장됨 (끝까지 녹화했는지는 아직 모름)"""
-        self.muxed.add(os.path.normcase(os.path.normpath(path)))
-        self._dispatch()
+    def flow(self):
+        return self.var_flow.get()
 
-    def _dispatch(self):
-        """끝까지 녹화를 마친('완료') 강의의 파일만 용량 줄이기로 보냄
-        (중지·종료·오류로 중간에 끊긴 파일은 줄이지 않음 → 상태도 '용량 줄이기 완료'가 되지 않음)"""
-        for iid in list(self.completed):
-            p = self.rec_files.get(iid)
-            key = os.path.normcase(os.path.normpath(p)) if p else None
-            if key not in self.muxed:
-                continue  # 아직 MP4 변환 중
-            self.completed.discard(iid)
-            self.muxed.discard(key)
-            self._verify_then(iid, p, lambda p=p: self._after_verified(p))
+    def _gap(self):
+        try:
+            return max(0, int(self.var_gap.get()))
+        except ValueError:
+            return 5
 
-    def _after_verified(self, p):
-        """끝까지 정상으로 녹화된 파일 → (설정에 따라) 용량 줄이기"""
-        if not self.var_enc.get():
+    # ------------------------------------------------------------ 표 행
+    def _state_text(self, r):
+        st, note = r["st"], r.get("note") or ""
+        if st in ("rec", "enc"):
+            word = "녹화 중" if st == "rec" else "인코딩 중"
+            if r.get("pct") is not None:
+                left = r.get("left")
+                tail = f", {int(left) // 60}분 {int(left) % 60}초 남음" if left is not None else ", 남은 시간 계산 중"
+                return f"{word}(진행률: {r['pct']:.1f}%{tail})"
+            return f"{word}({note})" if note else word
+        if st == "rec_fail":
+            return f"녹화 실패: {note}"
+        if st == "enc_fail":
+            return f"인코딩 실패: {note}"
+        text = STATE_FIXED[st]
+        return f"{text} ({note})" if note else text
+
+    def _values(self, r):
+        return r["no"], r.get("title", ""), r.get("len", ""), r["task"], self._state_text(r)
+
+    def _upd(self, iid, st=None, persist=True, **kw):
+        """행 바꾸기 (st: 상태 코드, kw: note/task/raw/enc/len/pct/left) → 표 다시 그림"""
+        if not iid or not self.tree.exists(iid):
             return
-        if self.cb_when.get() == self.ENC_WHEN[1] or not self.running:
-            self._send_encode([p])
-        else:
-            self.saved.append(p)
+        r = self.rows[iid]
+        if st is not None and st != r["st"]:
+            r["pct"] = r["left"] = None
+            r["note"] = ""
+        if st is not None:
+            r["st"] = st
+        r.update(kw)
+        self.tree.item(iid, values=self._values(r))
+        if persist:
+            self._persist()
 
-    def _send_encode(self, paths):
-        self.app.encode.enqueue(paths, self.enc_options(), bool(self.var_edel.get()))
-        for iid, p in self.rec_files.items():
-            if p in paths and self.tree.exists(iid):
-                self.tree.set(iid, "state", "인코딩 대기")
+    def _active_row(self, iid):
+        """지금 녹화·인코딩 중이거나 인코딩으로 보낸 행 (상태를 바꾸면 안 됨)"""
+        r = self.rows.get(iid)
+        return bool(r and (r["st"] in ("rec", "enc") or iid in self.enc_sent
+                           or (self.runner and iid == self.cur_row)))
 
-    def _encoded(self, src, state):
-        """용량 줄이기가 끝난 자동 녹화 파일 → 표에 표시"""
-        for iid, path in self.rec_files.items():
-            if os.path.normcase(path) == os.path.normcase(src) and self.tree.exists(iid):
-                self.tree.set(iid, "state", enc_state(state))
-                if state.startswith("완료"):  # 줄인 파일도 길이·용량 확인
-                    self._verify_then(iid, path, lambda: None)
-        self._save_rows()
+    def needs_rec(self, iid):
+        r = self.rows[iid]
+        return has_rec(r["task"]) and r["st"] in REC_NEED
 
-    def encode_progress(self, src, text):
-        """용량 줄이기 진행 상황 (예: 줄이는 중 35%) → 표에 표시"""
-        for iid, path in self.rec_files.items():
-            if os.path.normcase(path) == os.path.normcase(src) and self.tree.exists(iid):
-                self.tree.set(iid, "state", enc_state(text))
+    def needs_enc(self, iid):
+        r = self.rows[iid]
+        return has_enc(r["task"]) and r["st"] in ENC_NEED
 
-    def _start_rec(self, name):
-        """녹화 시작 (메인 스레드) + 이 행의 저장 파일 경로 기억
-        이 강의를 전에 녹화하다 끊긴 파일이 있으면 휴지통으로 보내고 처음부터 다시 녹화"""
-        old = self.rec_files.get(self.cur_row)
-        if old and os.path.isfile(old) and not self._done(self.tree.set(self.cur_row, "state")):
-            if to_recycle_bin(old):
-                self.lbl.config(text=f"끊긴 녹화 파일은 휴지통으로 보냈어요: {os.path.basename(old)}")
-        ok = self.app.start_recording(True, name)
-        if ok and self.cur_row is not None:
-            self.rec_files[self.cur_row] = os.path.normpath(self.app.rec_base + ".mp4")
-            self._persist()  # 갑자기 꺼져도 다음에 이 파일을 끊긴 파일로 알아보도록
-        return ok
+    def _stem(self, iid):
+        """이 강의의 파일 이름 (지금 설정한 형식)"""
+        r = self.rows[iid]
+        mins = None
+        if self.var_namelen.get():
+            exp = self._row_expect(iid)[0]
+            mins = max(1, round(exp / 60)) if exp else None
+        return lecture_stem(r["no"], r.get("title", ""), self.var_space.get(), mins)
 
     # -- 메인 스레드로 넘기기
     def _ui(self, fn, *args):
@@ -2045,15 +2267,18 @@ class AutoPanel(ttk.Frame):
 
     # -- 강의 표 (설정 파일에 저장해 두고 다음 실행 때 다시 보여줌)
     @staticmethod
-    def _done(state):
-        return state.startswith(("완료", "인코딩"))  # 인코딩 중·완료·실패도 녹화는 끝난 것
-
-    def _startup_check(self):
-        """다 녹화했다고 되어 있는 강의가 정말 끝까지 녹화됐는지 (예: 중간에 끊긴 파일이 완료로 남은 경우)"""
-        done = [i for i in self.tree.get_children()
-                if self._done(self.tree.set(i, "state")) and "직접 표시" not in self.tree.set(i, "state")]
-        if done and not self.running:
-            self.check_files(done, "녹화한 강의 확인")
+    def _old_state(text):
+        """예전 버전의 상태 문구 → 상태 코드"""
+        text = text or ""
+        if "직접 표시" in text:
+            return "skip"
+        if text.startswith(("인코딩 완료", "용량 줄이기 완료")):
+            return "enc_done"
+        if text.startswith(("인코딩", "용량 줄이기")):
+            return "enc_wait"
+        if text.startswith("완료"):
+            return "rec_done"
+        return "rec_wait"
 
     def _load_rows(self):
         try:
@@ -2061,24 +2286,21 @@ class AutoPanel(ttk.Frame):
         except ValueError:
             rows = []  # 예전 형식(입력한 글자 그대로)은 버림
         for r in rows if isinstance(rows, list) else []:
-            if isinstance(r, dict) and "no" in r:
-                state = r.get("state", "대기")
-                if state.startswith("용량 줄이기 "):  # 예전 이름 → 새 이름
-                    state = enc_state(state[len("용량 줄이기 "):])
-                iid = self._insert(r, state if self._done(state) else "대기", r.get("len", ""))
-                if r.get("file"):
-                    self.rec_files[iid] = r["file"]
+            if not (isinstance(r, dict) and "no" in r):
+                continue
+            st = r.get("st") if r.get("st") in ALL_STATES else self._old_state(r.get("state"))
+            # 녹화·인코딩 중에 프로그램이 꺼졌음
+            st = {"rec": "rec_stopped", "enc": "enc_stopped"}.get(st, st)
+            task = r.get("task") if r.get("task") in TASKS else ("건너뛰기" if st == "skip" else DEFAULT_TASK)
+            self._insert(r, st, task=task, length=r.get("len"), note=r.get("note", ""),
+                         raw=r.get("raw") or r.get("file") or "", enc=r.get("enc", ""))
         self._update_total()
 
     def _save_rows(self):
         rows = []
         for iid in self.tree.get_children():
-            lec = dict(self.rows[iid])
-            lec["state"] = self.tree.set(iid, "state")
-            lec["len"] = self.tree.set(iid, "len")
-            if self.rec_files.get(iid):
-                lec["file"] = self.rec_files[iid]
-            rows.append(lec)
+            r = self.rows[iid]
+            rows.append({k: r.get(k) for k in ("idx", "no", "title", "mins", "st", "note", "task", "len", "raw", "enc")})
         self.app.cfg["auto_list"] = json.dumps(rows, ensure_ascii=False)
 
     def _persist(self):
@@ -2089,34 +2311,127 @@ class AutoPanel(ttk.Frame):
         except OSError:
             pass
 
-    def _insert(self, lec, state="대기", length=None):
+    def _insert(self, lec, st="rec_wait", task=DEFAULT_TASK, length=None, note="", raw="", enc=""):
         if length is None:
             length = f"{lec['mins']}분" if lec.get("mins") is not None else ""
+        r = {k: lec.get(k) for k in ("idx", "no", "title", "mins")}
+        r.update(st=st, task=task, len=length or "", note=note or "", raw=raw or "", enc=enc or "",
+                 pct=None, left=None)
         # 항상 일련번호 오름차순 (들어갈 자리를 찾아 끼워 넣음)
         kids = self.tree.get_children()
-        pos = next((k for k, i in enumerate(kids) if self.rows[i]["no"] > lec["no"]), "end")
-        iid = self.tree.insert("", pos, values=(lec["no"], lec.get("title", ""), length, state))
-        self.rows[iid] = {k: lec.get(k) for k in ("idx", "no", "title", "mins")}
+        pos = next((k for k, i in enumerate(kids) if self.rows[i]["no"] > r["no"]), "end")
+        iid = self.tree.insert("", pos, values=self._values(r))
+        self.rows[iid] = r
         return iid
 
-    def _update_total(self):
-        todo = [iid for iid in self.tree.get_children() if not self._done(self.tree.set(iid, "state"))]
-        total = sum(self.rows[i].get("mins") or 0 for i in todo)
-        self.lbl_total.config(text=f"녹화할 강의 {len(todo)}개 · 약 {total // 60}시간 {total % 60}분" if todo else "")
+    def _startup_check(self):
+        """녹화·인코딩했다고 되어 있는 강의의 파일이 정말 있고 끝까지 녹화됐는지"""
+        rows = [i for i in self.tree.get_children()
+                if self.rows[i]["st"] in ("rec_done", "enc_wait", "enc_done", "enc_stopped", "enc_fail", "missing")]
+        if rows and not self.session:
+            self.check_files(rows, "녹화한 강의 확인")
 
+    # ------------------------------------------------------------ 남은 시간
+    def _enc_speed(self):
+        """인코딩에 걸리는 시간 / 영상 길이 (지난 인코딩에서 잰 값, 없으면 대략)"""
+        gpu = bool(self.var_egpu.get()) and self.app.encode.gpu_ok
+        try:
+            v = float(self.app.cfg.get("auto_enc_speed_gpu" if gpu else "auto_enc_speed_cpu") or 0)
+        except ValueError:
+            v = 0
+        return v if v > 0 else (0.15 if gpu else 0.5)
+
+    def _learn_speed(self, speed):
+        if not speed or speed <= 0:
+            return
+        key = "auto_enc_speed_gpu" if (self.var_egpu.get() and self.app.encode.gpu_ok) else "auto_enc_speed_cpu"
+        try:
+            old = float(self.app.cfg.get(key) or 0)
+        except ValueError:
+            old = 0
+        self.app.cfg[key] = f"{(old + speed) / 2 if old > 0 else speed:.3f}"
+
+    def _estimate(self):
+        """→ (녹화할 강의 수, 인코딩할 강의 수, 남은 초)"""
+        flow = self.flow()
+        gap = self._gap()
+        speed = self._enc_speed()
+        rec_n = enc_n = 0
+        rec_t = enc_t = last_enc = 0.0
+        for iid in self.tree.get_children():
+            r = self.rows[iid]
+            d = self._row_expect(iid)[0] or 0
+            will_enc = False
+            if r["st"] == "rec":
+                rec_n += 1
+                rec_t += (r["left"] if r.get("left") is not None else d + LECTURE_OVERHEAD) + 10
+                will_enc = has_enc(r["task"])
+            elif self.needs_rec(iid) and not (self.session and iid not in self.run_rows):
+                rec_n += 1
+                rec_t += d + LECTURE_OVERHEAD + gap
+                will_enc = has_enc(r["task"])
+            if flow == "rec":
+                continue
+            if r["st"] == "enc":
+                enc_n += 1
+                enc_t += r["left"] if r.get("left") is not None else d * speed
+            elif will_enc or self.needs_enc(iid):
+                enc_n += 1
+                enc_t += d * speed
+                if will_enc:
+                    last_enc = d * speed
+        if flow == "each":  # 녹화하면서 앞 강의를 인코딩 → 더 오래 걸리는 쪽 + 마지막 강의 인코딩
+            total = max(rec_t + last_enc, enc_t)
+        elif flow == "all":
+            total = rec_t + enc_t
+        else:
+            total = rec_t
+        return rec_n, enc_n, total
+
+    def _update_total(self):
+        if not hasattr(self, "var_egpu"):
+            return  # build_encode 전
+        rec_n, enc_n, total = self._estimate()
+        if not rec_n and not enc_n:
+            text = "남은 작업이 없어요" if self.tree.get_children() else ""
+        else:
+            parts = []
+            if rec_n:
+                parts.append(f"녹화 {rec_n}개")
+            if enc_n:
+                parts.append(f"인코딩 {enc_n}개")
+            now = datetime.now()
+            end = fmt_clock(now + timedelta(seconds=total), now)
+            if self.session:
+                text = " · ".join(parts) + f"  |  남은 시간 약 {fmt_hm(total)}  |  종료 예정 {end}"
+            else:
+                text = " · ".join(parts) + f"  |  예상 소요 약 {fmt_hm(total)}  |  지금 시작하면 {end} 종료 예정"
+        if self.lbl_total.cget("text") != text:
+            self.lbl_total.config(text=text)
+
+    def _tick(self):
+        """1초마다: 남은 시간 표시, (작업 중이면) 인코딩 보내기·작업 끝 확인"""
+        try:
+            if self.session:
+                self._pump()
+                self._check_done()
+            self._update_total()
+        finally:
+            self.after(1000, self._tick)
+
+    # ------------------------------------------------------------ 상태·작업 바꾸기
     def remove_selected(self):
         for iid in self.tree.selection():
-            if self.running and iid == self.cur_row:
-                self.lbl.config(text="지금 녹화 중인 강의는 지울 수 없어요.")
+            if self._active_row(iid):
+                self.lbl.config(text="지금 녹화·인코딩 중인 강의는 지울 수 없어요.")
                 continue
             self.tree.delete(iid)
             self.rows.pop(iid, None)
-            self.rec_files.pop(iid, None)
         self._update_total()
         self._persist()
 
     def _popup(self, ev):
-        """표 오른쪽 클릭 → 상태 변경 메뉴 (누른 행이 선택에 없으면 그 행만 선택)"""
+        """표 오른쪽 클릭 → 작업·상태 변경 메뉴 (누른 행이 선택에 없으면 그 행만 선택)"""
         iid = self.tree.identify_row(ev.y)
         if not iid:
             return
@@ -2124,118 +2439,139 @@ class AutoPanel(ttk.Frame):
             self.tree.selection_set(iid)
         self.menu.tk_popup(ev.x_root, ev.y_root)
 
-    def set_state(self, state):
-        """선택한 강의의 상태를 직접 바꿈 (예: 녹화 파일이 이상해서 지웠으면 '다시 녹화하기')
-        자동 녹화 중이면 지금 강의가 끝난 뒤 이어서 녹화"""
+    def _on_state_combo(self, ev=None):
+        choice = self.cb_state.get()
+        self.cb_state.set("상태 변경")
+        self.cb_state.selection_clear()
+        self.tree.focus_set()
+        self.set_state(choice)
+
+    def _sel(self):
         sel = list(self.tree.selection())
         if not sel:
             self.lbl.config(text="표에서 강의를 먼저 선택해 주세요.")
+        return sel
+
+    def set_state(self, choice):
+        """선택한 강의의 상태를 직접 바꿈 (작업도 그 상태에 맞게: 예) 인코딩 대기 → 작업에 인코딩 포함)"""
+        code = dict(STATE_CHOICES).get(choice)
+        if code in ("rec", "enc"):
+            self.lbl.config(text=f"'{choice}'은(는) 작업이 진행되면 저절로 바뀌어요.")
             return
-        redo = not self._done(state)
-        n = 0
+        if not code:
+            return
+        sel = self._sel()
+        n, busy, confirm = 0, 0, []
         for iid in sel:
-            if self.running and iid == self.cur_row:
-                continue  # 지금 녹화 중인 강의는 그대로
-            self.tree.set(iid, "state", state)
+            if self._active_row(iid):
+                busy += 1
+                continue
+            task = self.rows[iid]["task"]
+            if code == "skip":
+                task = "건너뛰기"
+            elif code == "rec_wait" and not has_rec(task):
+                task = DEFAULT_TASK
+            elif code == "enc_wait" and not has_enc(task):
+                task = DEFAULT_TASK if task == "녹화" else "인코딩"
+            elif task == "건너뛰기":
+                task = DEFAULT_TASK
+            self._upd(iid, code, persist=False, task=task)
             n += 1
-            if redo:
+            if code == "rec_wait":
                 self._requeue(iid)
-        self._update_total()
+            if code in ("rec_done", "enc_wait", "enc_done"):
+                confirm.append(iid)
         self._persist()
-        if n:
-            what = "다시 녹화" if redo else "완료로 표시"
-            self.lbl.config(text=f"{n}개를 {what}했어요."
-                                 + (" 지금 녹화가 끝나면 이어서 녹화해요." if redo and self.running else
-                                    " '자동 녹화 시작'을 누르면 녹화해요." if redo else ""))
+        self._update_total()
+        msg = f"{n}개를 '{choice}'(으)로 바꿨어요." if n else ""
+        if busy:
+            msg += f" 지금 작업 중인 {busy}개는 그대로 뒀어요."
+        if n and code == "rec_wait":
+            msg += " 지금 녹화가 끝나면 이어서 녹화해요." if self.runner else " '작업 시작'을 누르면 녹화해요."
+        if n and code == "enc_wait":
+            msg += " '작업 시작'을 누르면 인코딩해요." if not self.session else ""
+        if msg:
+            self.lbl.config(text=msg.strip())
+        if confirm:
+            self._confirm_files(confirm, code)
+        self._pump()
 
-    def _rec_path(self, iid):
-        return self.rec_files.get(iid) or os.path.join(self.app.var_dir.get(), f"제 {self.rows[iid]['no']} 강.mp4")
-
-    def _unencoded(self):
-        """녹화만 끝나고 아직 인코딩 안 한 강의 ('완료' 상태, 직접 표시는 제외)"""
-        return [i for i in self.tree.get_children()
-                if self.tree.set(i, "state").startswith("완료") and "직접 표시" not in self.tree.set(i, "state")]
-
-    def encode_selected(self):
-        """상태 변경 → 인코딩 대기: 선택한 강의의 녹화 파일을 용량 줄이기로 보냄"""
-        sel = [i for i in self.tree.selection() if not self._busy_encoding(self.tree.set(i, "state"))]
-        if not sel:
-            self.lbl.config(text="표에서 강의를 먼저 선택해 주세요." if not self.tree.selection()
-                            else "이미 인코딩 대기·인코딩 중인 강의예요.")
-            return
-        self.encode_rows(sel, force=True)
-
-    def encode_rows(self, iids, note="", later=False, force=False):
-        """녹화 파일을 확인한 뒤 용량 줄이기로 보냄
-        - 덜 녹화됐거나 깨진 파일은 다시 녹화로
-        - 이미 줄인 파일은 '인코딩 완료'로 (force: 직접 고른 경우엔 그래도 다시 줄임)
-        - later: 자동 녹화가 모두 끝난 뒤에 줄임"""
-        jobs = [(iid, self._rec_path(iid), *self._row_expect(iid)) for iid in iids
-                if self.tree.exists(iid) and not (self.running and iid == self.cur_row)]
-        if not jobs:
-            return
+    def _confirm_files(self, iids, code):
+        """상태를 직접 '녹화 완료/인코딩 대기/인코딩 완료'로 바꾼 강의: 그 파일이 정말 있는지만 확인"""
+        out_dir = self.app.var_dir.get()
+        jobs = [(iid, self.rows[iid]["no"], self.rows[iid].get("raw"), self.rows[iid].get("enc")) for iid in iids]
 
         def work():
-            import glob
             res = []
-            for iid, path, exp, tol in jobs:
-                if not os.path.isfile(path):
-                    res.append((iid, path, "파일 없음", False))
-                    continue
-                info = media_info(path)
-                small = [x for x in glob.glob(glob.escape(os.path.splitext(path)[0]) + "_small*.mp4")
-                         if not x.endswith(".part.mp4")]
-                res.append((iid, path, self._judge(path, info, exp, tol), is_encoded(info) or bool(small)))
+            for iid, no, raw, enc in jobs:
+                raws, encs = scan_lecture_files(out_dir, no, (raw, enc))
+                res.append((iid, raws[0][0] if raws else "", encs[0][0] if encs else ""))
             self._ui(done, res)
 
         def done(res):
-            send, bad, already, missing = [], 0, 0, 0
-            for iid, path, problem, enc in res:
-                if not self.tree.exists(iid) or (self.running and iid == self.cur_row):
+            missing = 0
+            for iid, raw, enc in res:
+                if not self.tree.exists(iid) or self._active_row(iid) or self.rows[iid]["st"] != code:
                     continue
-                state = self.tree.set(iid, "state")
-                if problem == "파일 없음" and not self._done(state):
-                    missing += 1  # 아직 녹화 안 한 강의
-                    continue
-                if problem:
-                    bad += 1
-                    self._mark_bad(iid, None if problem == "파일 없음" else path, problem)
-                    continue
-                self.rec_files[iid] = os.path.normpath(path)
-                if enc and not force:
-                    already += 1
-                    self.tree.set(iid, "state", "인코딩 완료")
-                    continue
-                send.append(self.rec_files[iid])
-            if send and later and self.running:
-                self.saved.extend(send)
-                for iid, p in self.rec_files.items():
-                    if p in send and self.tree.exists(iid):
-                        self.tree.set(iid, "state", "인코딩 대기 (녹화가 모두 끝나면)")
-            elif send:
-                self._send_encode(send)
-            self._update_total()
+                need = enc if code == "enc_done" else raw
+                if need:
+                    self._upd(iid, persist=False, raw=raw, enc=enc)
+                else:
+                    missing += 1
+                    self._upd(iid, "missing", persist=False, raw=raw, enc=enc)
             self._persist()
-            parts = [note] if note else []
-            if send:
-                parts.append(f"녹화만 된 강의 {len(send)}개 인코딩 대기"
-                             + (" (녹화가 모두 끝나면 시작)" if later and self.running else ""))
-            if already:
-                parts.append(f"이미 인코딩된 강의 {already}개")
-            if bad:
-                parts.append(f"파일이 이상한 강의 {bad}개는 다시 녹화")
             if missing:
-                parts.append(f"녹화 파일이 없는 강의 {missing}개는 건너뜀")
-            if parts:
-                self.lbl.config(text="  ·  ".join(parts))
+                self.lbl.config(text=f"파일이 없는 강의 {missing}개는 '파일이 존재하지 않습니다.'로 표시했어요.")
         threading.Thread(target=work, daemon=True).start()
 
+    def set_task(self, task):
+        """선택한 강의의 작업 (녹화 / 인코딩 / 녹화 및 인코딩 / 건너뛰기)"""
+        sel = self._sel()
+        n, busy, recheck = 0, 0, []
+        for iid in sel:
+            r = self.rows[iid]
+            if task == "건너뛰기" and self._active_row(iid):
+                busy += 1
+                continue
+            if task == "건너뛰기":
+                self._upd(iid, "skip", persist=False, task=task)
+            elif r["st"] == "skip":  # 건너뛰기를 풀면 파일을 보고 상태를 다시 정함
+                self._upd(iid, "rec_wait", persist=False, task=task)
+                recheck.append(iid)
+            else:
+                st = r["st"]
+                if not self._active_row(iid):
+                    if st == "rec_done" and has_enc(task):
+                        st = "enc_wait"
+                    elif st == "enc_wait" and not has_enc(task):
+                        st = "rec_done"
+                self._upd(iid, st, persist=False, task=task)
+            n += 1
+            if self.needs_rec(iid):
+                self._requeue(iid)
+        self._persist()
+        self._update_total()
+        msg = f"{n}개의 작업을 '{task}'(으)로 바꿨어요." if n else ""
+        if busy:
+            msg += f" 지금 작업 중인 {busy}개는 건너뛸 수 없어요."
+        if msg:
+            self.lbl.config(text=msg.strip())
+        if recheck and not self.session:
+            self.check_files(recheck, msg.strip())
+        self._pump()
+
     def _requeue(self, iid):
-        """자동 녹화 중이면 이 강의를 지금 하는 것들이 끝난 뒤 이어서 녹화"""
-        if self.running and iid != self.cur_row and iid not in self._pending():
+        """녹화 중이면 이 강의를 지금 하는 것들이 끝난 뒤 이어서 녹화"""
+        if self.runner and iid != self.cur_row and iid not in self._pending():
             self.runner.lectures.append(dict(self.rows[iid]))
             self.run_rows.append(iid)
 
+    def _pending(self):
+        """이번 자동 녹화에서 아직 차례가 오지 않은 행"""
+        pos = self.run_rows.index(self.cur_row) if self.cur_row in self.run_rows else -1
+        return set(self.run_rows[pos + 1:])
+
+    # ------------------------------------------------------------ 파일 확인
     @staticmethod
     def _expected(length, lec):
         """표의 '길이'로 기대하는 영상 길이(초)와 허용 오차 → (초, 오차) 또는 (None, 0)"""
@@ -2270,53 +2606,37 @@ class AutoPanel(ttk.Frame):
         return None
 
     def _row_expect(self, iid):
-        return self._expected(self.tree.set(iid, "len"), self.rows[iid])
+        return self._expected(self.rows[iid].get("len"), self.rows[iid])
 
-    def _mark_bad(self, iid, path, problem):
-        """비정상 파일 → '... - 다시 녹화' (자동 녹화 중이면 이어서 녹화, 다시 녹화하면 그 파일은 휴지통으로)"""
-        if path:
-            self.rec_files[iid] = os.path.normpath(path)
-        self.tree.set(iid, "state", f"{problem} - 다시 녹화")
-        self._requeue(iid)
-
-    def _verify_then(self, iid, path, then):
-        """방금 만든 파일을 확인 → 정상이면 then(), 아니면 다시 녹화"""
+    def _verify(self, iid, path, ok, bad):
+        """만든 파일을 확인 → 정상이면 ok(), 아니면 bad(문제 문구)"""
         exp, tol = self._row_expect(iid)
+        self.verifying += 1
 
         def work():
             problem = self._judge(path, media_info(path), exp, tol) if os.path.isfile(path) else "파일 없음"
             self._ui(done, problem)
 
         def done(problem):
-            if not self.tree.exists(iid):
-                return
-            if problem:
-                self._mark_bad(iid, path, problem)
-                self.lbl.config(text=f"{self.rows[iid]['no']}강 파일이 이상해요 ({problem}) → 다시 녹화해요")
-                self._update_total()
-                self._persist()
-            else:
-                then()
+            self.verifying -= 1
+            if self.tree.exists(iid):
+                bad(problem) if problem else ok()
+            self._check_done()
         threading.Thread(target=work, daemon=True).start()
 
-    def _busy_encoding(self, state):
-        return state.startswith("인코딩") and not any(w in state for w in ("완료", "실패", "중지"))
-
     def check_files(self, iids=None, note=""):
-        """상태 체크: 강의마다 녹화 파일이 있는지, 열리는지, 끝까지 녹화됐는지, 인코딩됐는지 확인해서 상태를 고침
-        iids를 주면 그 강의만 (LESSON 추가 때). 용량 줄이기 중이면 잠시 멈추고 먼저 확인"""
+        """상태 체크: 강의마다 녹화 원본·인코딩한 파일이 있는지, 열리는지, 끝까지 녹화됐는지 확인해서 상태를 고침
+        iids를 주면 그 강의만 (LESSON 추가 때). 인코딩 중이면 잠시 멈추고 먼저 확인"""
         out_dir = self.app.var_dir.get()
         jobs = []
         for iid in (self.tree.get_children() if iids is None else iids):
             if not self.tree.exists(iid):
                 continue
-            state = self.tree.set(iid, "state")
-            if (self.running and iid == self.cur_row) or "직접 표시" in state:
-                continue  # 지금 녹화 중 / 일부러 완료로 표시한 강의는 그대로
-            lec = self.rows[iid]
-            path = self.rec_files.get(iid) or os.path.join(out_dir, f"제 {lec['no']} 강.mp4")
-            exp, tol = self._expected(self.tree.set(iid, "len"), lec)
-            jobs.append((iid, path, exp, tol))
+            r = self.rows[iid]
+            if self._active_row(iid) or r["st"] == "skip":
+                continue  # 지금 작업 중 / 건너뛰기로 한 강의는 그대로
+            exp, tol = self._row_expect(iid)
+            jobs.append((iid, r["no"], r.get("raw"), r.get("enc"), exp, tol))
         if not jobs:
             self.lbl.config(text=note or "확인할 강의가 없어요.")
             return
@@ -2325,87 +2645,80 @@ class AutoPanel(ttk.Frame):
         if paused:
             enc.pause(True)
         self.btn_check.config(state="disabled")
-        self.lbl.config(text=f"상태 체크 중... (0/{len(jobs)})" + ("  ·  용량 줄이기는 잠시 멈춤" if paused else ""))
+        self.lbl.config(text=f"상태 체크 중... (0/{len(jobs)})" + ("  ·  인코딩은 잠시 멈춤" if paused else ""))
 
         def work():
-            import glob
             res = []
-            for k, (iid, path, exp, tol) in enumerate(jobs):
-                # 원본을 남기고 줄였으면 '제 N 강_small.mp4'가 따로 있음
-                base = os.path.splitext(path)[0]
-                small = sorted(glob.glob(glob.escape(base) + "_small*.mp4"))
-                small = [x for x in small if not x.endswith(".part.mp4")]
-                if not os.path.isfile(path) and small:
-                    path = small[0]
-                if os.path.isfile(path):
-                    info = media_info(path)
-                    enc = is_encoded(info) or bool(small)
-                    res.append((iid, path, True, self._judge(path, info, exp, tol), info["dur"], enc))
-                else:
-                    res.append((iid, path, False, None, None, False))
+            for k, (iid, no, raw, encp, exp, tol) in enumerate(jobs):
+                raws, encs = scan_lecture_files(out_dir, no, (raw, encp))
+                rp, rprob = (raws[0][0], self._judge(raws[0][0], raws[0][1], exp, tol)) if raws else ("", None)
+                ep, eprob = (encs[0][0], self._judge(encs[0][0], encs[0][1], exp, tol)) if encs else ("", None)
+                res.append((iid, rp, rprob, ep, eprob))
                 self._ui(self.lbl.config, {"text": f"상태 체크 중... ({k + 1}/{len(jobs)})"})
-            self._ui(self._check_done, res, paused, note)
+            self._ui(self._check_files_done, res, paused, note)
         threading.Thread(target=work, daemon=True).start()
 
-    def _check_done(self, res, paused, note=""):
+    def _check_files_done(self, res, paused, note=""):
         if paused:
             self.app.encode.pause(False)
         self.btn_check.config(state="normal")
-        good = bad = 0
+        good = bad = missing = 0
         bad_rows = []
-        for iid, path, exists, problem, dur, enc in res:
-            if not self.tree.exists(iid) or (self.running and iid == self.cur_row):
+        for iid, raw, rprob, enc, eprob in res:
+            if not self.tree.exists(iid) or self._active_row(iid) or self.rows[iid]["st"] == "skip":
                 continue
-            state = self.tree.set(iid, "state")
-            if not exists:
-                if self._done(state) or self._busy_encoding(state):
-                    problem, path = "파일 없음", None
-                else:
-                    continue  # 아직 녹화 안 한 강의
-            if not problem:  # 끝까지 정상으로 녹화된 파일
-                self.rec_files[iid] = os.path.normpath(path)
+            st = self.rows[iid]["st"]
+            kw = {"raw": raw, "enc": enc}
+            if enc and not eprob:  # 인코딩까지 끝난 강의
                 good += 1
-                if self._busy_encoding(state):
-                    continue  # 용량 줄이기 진행 표시는 그대로
-                new = ("인코딩 완료" if enc else "완료") + f"  ✓ {fmt_secs(dur)}"
-                self.tree.set(iid, "state", new)
-                continue
-            bad += 1
-            bad_rows.append(iid)
-            self._mark_bad(iid, path, problem)
+                self._upd(iid, "enc_done", persist=False, **kw)
+            elif raw and not rprob:  # 녹화는 정상
+                good += 1
+                if st in ("enc_wait", "enc_stopped", "enc_fail"):
+                    self._upd(iid, persist=False, **kw)
+                else:
+                    self._upd(iid, "enc_wait" if st == "enc_done" and has_enc(self.rows[iid]["task"]) else "rec_done",
+                              persist=False, **kw)
+            elif raw or enc:  # 파일이 이상함 → 다시 녹화
+                problem = rprob or eprob
+                if st in ("rec_wait", "rec_stopped", "rec_fail"):
+                    self._upd(iid, persist=False, **kw)  # 원래 녹화할 강의 (중지·실패 표시는 그대로)
+                    continue
+                bad += 1
+                bad_rows.append(iid)
+                self._upd(iid, "rec_wait", persist=False, **kw)
+                self._upd(iid, persist=False, note=f"파일 이상: {problem}")
+                self._requeue(iid)
+            else:  # 파일이 없음
+                if st in ("rec_wait", "rec_stopped", "rec_fail", "missing"):
+                    self._upd(iid, persist=False, **kw)
+                    continue
+                missing += 1
+                bad_rows.append(iid)
+                self._upd(iid, "missing", persist=False, **kw)
         self._update_total()
         self._persist()
+        self._name_preview()
         if bad_rows:
             self.tree.selection_set(bad_rows)
             self.tree.see(bad_rows[0])
-        msg = (note + "  ·  " if note else "") + f"상태 체크 - 녹화된 강의 {good}개" \
-            + (f", 다시 녹화할 강의 {bad}개 (선택해 둠)" if bad else "")
-        if bad and self.running:
-            msg += " · 지금 녹화가 끝나면 이어서 녹화해요"
-        elif bad:
-            msg += " · '자동 녹화 시작'을 누르면 녹화해요"
+        msg = (note + "  ·  " if note else "") + f"상태 체크 - 파일이 정상인 강의 {good}개"
+        if bad:
+            msg += f", 파일이 이상해서 다시 녹화할 강의 {bad}개"
+        if missing:
+            msg += f", 파일이 없는 강의 {missing}개"
+        if bad_rows:
+            msg += " (선택해 둠)"
         if paused:
-            msg += " · 용량 줄이기 다시 시작"
+            msg += " · 인코딩 다시 시작"
         self.lbl.config(text=msg)
-
-    def _pending(self):
-        """이번 자동 녹화에서 아직 차례가 오지 않은 행"""
-        try:
-            pos = self.run_rows.index(self.cur_row) if self.cur_row in self.run_rows else -1
-        except ValueError:
-            pos = -1
-        return set(self.run_rows[pos + 1:])
-
-    def _skip(self, i):
-        """자동 녹화가 i번째 강의를 시작하기 직전: 그 사이 표에서 지웠거나 완료로 바꿨으면 건너뜀"""
-        iid = self._row(i)
-        return not iid or not self.tree.exists(iid) or self._done(self.tree.set(iid, "state"))
 
     def open_file(self, folder):
         sel = self.tree.selection()
-        path = self.rec_files.get(sel[0]) if sel else None
-        if not path or not os.path.isfile(path):
-            messagebox.showinfo("녹화 파일", "이 강의의 녹화 파일이 없어요." + (f"\n{path}" if path else ""))
+        r = self.rows.get(sel[0]) if sel else None
+        path = next((p for p in ((r.get("enc"), r.get("raw")) if r else ()) if p and os.path.isfile(p)), None)
+        if not path:
+            messagebox.showinfo("녹화 파일", "이 강의의 녹화 파일이 없어요.")
             return
         if folder:
             subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
@@ -2413,19 +2726,94 @@ class AutoPanel(ttk.Frame):
             os.startfile(path)
 
     def clear_rows(self):
-        if self.running or not self.rows:
+        if self.session or not self.rows:
             return
         if messagebox.askyesno("모두 지우기", "표의 강의를 모두 지울까요?\n(녹화한 파일은 지우지 않아요)"):
             self.tree.delete(*self.tree.get_children())
             self.rows.clear()
-            self.rec_files.clear()
             self._update_total()
             self._persist()
 
+    # ------------------------------------------------------------ 파일 이름 일괄 변경
+    def rename_files(self):
+        """표의 강의마다 녹화 원본·인코딩한 파일의 이름을 지금 형식으로 바꿈"""
+        if self.session:
+            messagebox.showinfo("파일 이름 일괄 변경", "작업이 끝난 뒤에 바꿀 수 있어요.")
+            return
+        rows = [i for i in self.tree.get_children()]
+        if not rows:
+            self.lbl.config(text="표에 강의가 없어요.")
+            return
+        if not messagebox.askyesno(
+                "파일 이름 일괄 변경",
+                f"표의 강의 {len(rows)}개의 녹화 원본·인코딩한 파일 이름을 지금 형식으로 바꿀까요?\n\n"
+                f"예) {self._stem(rows[0])}{RAW_TAG}.mp4  /  {self._stem(rows[0])}.mp4\n\n"
+                "같은 이름의 다른 파일이 이미 있으면 그 강의는 바꾸지 않아요."):
+            return
+        out_dir = self.app.var_dir.get()
+        space, with_len = self.var_space.get(), bool(self.var_namelen.get())
+        jobs = [(iid, self.rows[iid]["no"], self.rows[iid].get("title", ""), self.rows[iid].get("raw"),
+                 self.rows[iid].get("enc")) for iid in rows]
+        self.btn_rename.config(state="disabled")
+        self.btn_start.config(state="disabled")
+        self.lbl.config(text=f"파일 이름 바꾸는 중... (0/{len(jobs)})")
+
+        def target(p, info, no, title, tag):
+            dur = info.get("dur") if info else None
+            mins = max(1, round(dur / 60)) if (with_len and dur) else None
+            return os.path.join(os.path.dirname(p), lecture_stem(no, title, space, mins) + tag + ".mp4")
+
+        def work():
+            res, n_ok, n_same, n_fail = [], 0, 0, 0
+            for k, (iid, no, title, raw, enc) in enumerate(jobs):
+                raws, encs = scan_lecture_files(out_dir, no, (raw, enc))
+                new = {"raw": raws[0][0] if raws else "", "enc": encs[0][0] if encs else ""}
+                for kind, lst, tag in (("raw", raws, RAW_TAG), ("enc", encs, "")):
+                    if not lst:
+                        continue
+                    p, info = lst[0]
+                    t = target(p, info, no, title, tag)
+                    if os.path.normcase(t) == os.path.normcase(p):
+                        if t != p:  # 대소문자만 다름
+                            try:
+                                os.rename(p, t)
+                            except OSError:
+                                pass
+                        new[kind] = t
+                        n_same += 1
+                    elif os.path.exists(t):
+                        n_fail += 1
+                    else:
+                        try:
+                            os.rename(p, t)
+                            new[kind] = t
+                            n_ok += 1
+                        except OSError:
+                            n_fail += 1
+                res.append((iid, new))
+                self._ui(self.lbl.config, {"text": f"파일 이름 바꾸는 중... ({k + 1}/{len(jobs)})"})
+            self._ui(done, res, n_ok, n_same, n_fail)
+
+        def done(res, n_ok, n_same, n_fail):
+            for iid, new in res:
+                if self.tree.exists(iid):
+                    self._upd(iid, persist=False, **new)
+            self._persist()
+            self.btn_rename.config(state="normal")
+            self.btn_start.config(state="normal")
+            msg = f"파일 이름 일괄 변경 - {n_ok}개 바꿈"
+            if n_same:
+                msg += f", 이미 같은 이름 {n_same}개"
+            if n_fail:
+                msg += f", 같은 이름의 파일이 있거나 사용 중이라 못 바꾼 파일 {n_fail}개"
+            self.lbl.config(text=msg)
+        threading.Thread(target=work, daemon=True).start()
+
+    # ------------------------------------------------------------ LESSON 추가
     def add_dialog(self):
         """LESSON 입력 창 → Edge 강의 목록에서 찾아 표에 추가"""
         import lecture_auto
-        if self.running:
+        if self.session:
             return
         d = tk.Toplevel(self)
         d.title("LESSON 추가")
@@ -2485,9 +2873,10 @@ class AutoPanel(ttk.Frame):
                     added += 1
             self._update_total()
             self._persist()
+            self._name_preview()
             note = f"{added}개 추가" + (f", 이미 표에 있는 {dup}개는 상태만 확인" if dup else "")
             self.lbl.config(text=note)
-            if check and not self.running:
+            if check and not self.session:
                 self.check_files(check, note)
             if not bad:
                 d.destroy()
@@ -2508,148 +2897,334 @@ class AutoPanel(ttk.Frame):
         txt.focus_set()
 
     def save(self):
+        if not hasattr(self, "var_eq"):
+            return  # build_encode 전
         self._save_rows()
         self.app.cfg["auto_gap"] = self.var_gap.get().strip() or "5"
         self.app.cfg.update(
-            auto_enc=self.var_enc.get(), auto_enc_when=self.cb_when.get(), auto_enc_quality=self.var_eq.get(),
+            auto_flow=self.var_flow.get(), auto_enc_quality=self.var_eq.get(),
             auto_enc_res=self.cb_eres.get(), auto_enc_fps=self.cb_efps.get(), auto_enc_gpu=self.var_egpu.get(),
-            auto_enc_delete=self.var_edel.get())
+            auto_enc_delete=self.var_edel.get(), auto_name_space=self.var_space.get(),
+            auto_name_len=self.var_namelen.get())
 
-    # -- 실행
+    # ------------------------------------------------------------ 실행
     def start(self):
         import lecture_auto
-        if self.running:
+        if self.session:
             return
         if self.app.recording or self.app.busy:
-            messagebox.showwarning("자동 녹화", "녹화나 MP4 변환이 끝난 뒤에 시작해 주세요.")
+            messagebox.showwarning("작업 시작", "녹화나 MP4 변환이 끝난 뒤에 시작해 주세요.")
             return
-        todo = [iid for iid in self.tree.get_children() if not self._done(self.tree.set(iid, "state"))]
-        unenc = self._unencoded() if self.var_enc.get() else []
-        if not todo and unenc:  # 녹화할 건 없고 인코딩만 남음 → 캡쳐 장치 없이도 됨
-            self.save()
-            save_config(self.app.cfg)
-            self.encode_rows(unenc, "녹화할 강의는 없어요")
+        kids = self.tree.get_children()
+        rec_rows = [i for i in kids if self.needs_rec(i)]
+        enc_rows = [i for i in kids if self.needs_enc(i)] if self.flow() != "rec" else []
+        if not rec_rows and not enc_rows:
+            text = "할 작업이 없어요. 'LESSON 추가'로 강의를 추가하거나 표의 '작업'·'상태'를 확인해 주세요."
+            if self.flow() == "rec" and any(self.needs_enc(i) for i in kids):
+                text += "\n('녹화만 진행'을 골라서 인코딩은 하지 않아요)"
+            messagebox.showwarning("작업 시작", text)
             return
-        if todo and (not self.app.video or self.app.video.get_frame() is None):
-            messagebox.showwarning("자동 녹화", "캡쳐 장치의 영상 신호가 아직 들어오지 않았어요.")
-            return
-        if not todo:
-            messagebox.showwarning("자동 녹화", "녹화할 강의가 없어요. 'LESSON 추가'로 강의를 추가해 주세요."
-                                   + ("\n(표의 강의는 모두 녹화를 마쳤어요)" if self.rows else ""))
+        if rec_rows and (not self.app.video or self.app.video.get_frame() is None):
+            messagebox.showwarning("작업 시작", "캡쳐 장치의 영상 신호가 아직 들어오지 않았어요.")
             return
         self.save()
         save_config(self.app.cfg)
+        if not rec_rows:  # 인코딩만 → 캡쳐 장치·Edge 없이도 됨
+            self._begin([], enc_rows)
+            return
         self.btn_start.config(state="disabled")
         self.lbl.config(text="Edge에서 강의 목록 확인 중...")
 
         def work():  # 그 사이 목록이 바뀌었을 수 있으므로 시작할 때 다시 확인
             try:
                 lecs = lecture_auto.read_lectures()
-                self._ui(self._go, todo, lecs)
+                self._ui(self._go, rec_rows, enc_rows, lecs)
             except Exception as e:
-                self._ui(self._not_started, f"강의 목록을 읽지 못했어요: {e}")
+                self._ui(self._not_started, f"강의 목록을 읽지 못했어요: {e}", enc_rows)
         threading.Thread(target=work, daemon=True).start()
 
-    def _not_started(self, msg):
+    def _not_started(self, msg, enc_rows=()):
         self.btn_start.config(state="normal")
         self.lbl.config(text=msg)
+        if enc_rows and messagebox.askyesno("작업 시작", f"{msg}\n\n녹화는 빼고 인코딩만 할까요?"):
+            self._begin([], list(enc_rows))
 
-    def _go(self, todo, lecs):
-        import lecture_auto
+    def _go(self, rec_rows, enc_rows, lecs):
         by_no = {}
         for lec in lecs:
             by_no.setdefault(lec["no"], lec)
-        items, self.run_rows = [], []
-        for iid in todo:
+        items, run_rows = [], []
+        for iid in rec_rows:
             if not self.tree.exists(iid):
                 continue
             lec = by_no.get(self.rows[iid]["no"])
             if lec:
-                self.rows[iid] = lec
+                self.rows[iid].update({k: lec.get(k) for k in ("idx", "no", "title", "mins")})
                 items.append(lec)
-                self.run_rows.append(iid)
-                self.tree.set(iid, "state", "대기")
+                run_rows.append(iid)
             else:
-                self.tree.set(iid, "state", "Edge 목록에 없음 - 건너뜀")
-        if not items:
+                self._upd(iid, "rec_fail", persist=False, note="Edge 목록에 없음")
+        if not items and not enc_rows:
             self._not_started("Edge 목록에서 찾은 강의가 없어요. 강의 목록을 펼쳐 두었는지 확인해 주세요.")
             return
-        try:
-            gap = max(0, int(self.var_gap.get()))
-        except ValueError:
-            gap = 5
-        hooks = {
-            "start_rec": lambda name: self._call(self._start_rec, name),
-            "stop_rec": lambda: self._call(self._stop_rec),
-            "is_busy": lambda: self.app.busy,
-            "skip": lambda i: self._call(self._skip, i),
-            "status": lambda i, text: self._ui(self._set, i, text),
-            "length": lambda i, sec: self._ui(self._set_len, i, sec),
-            "log": lambda text: self._ui(self.lbl.config, {"text": text}),
-            "finished": lambda msg: self._ui(self._finished, msg),
-        }
-        self.runner = lecture_auto.AutoRecorder(items, hooks, gap=gap)
-        self.saved = []
-        self.muxed, self.completed = set(), set()
-        self.cur_row = None
+        self.run_rows = run_rows
+        self._begin(items, enc_rows)
+
+    def _begin(self, items, enc_rows):
+        import lecture_auto
+        self.session = True
         self.stopped = False
-        for w in (self.btn_add, self.btn_clear, self.btn_edge):
+        self.muxed, self.completed = set(), set()
+        self.enc_sent = {}
+        self.cur_row = None
+        self.counts = {"rec": 0, "enc": 0, "fail": 0}
+        if not items:
+            self.run_rows = []
+        for iid in self.run_rows:
+            self._upd(iid, "rec_wait", persist=False)
+        for iid in enc_rows:
+            if self.tree.exists(iid):
+                self._upd(iid, "enc_wait", persist=False)
+        for w in (self.btn_start, self.btn_add, self.btn_clear, self.btn_edge, self.btn_rename):
             w.config(state="disabled")
-        self._enc_state()
         self.btn_stop.config(state="normal")
-        self.lbl.config(text="자동 녹화 중... (Edge 강의 창과 마우스는 건드리지 마세요)")
         keep_awake(True)
-        self.runner.start()
-        unenc = self._unencoded() if self.var_enc.get() else []
-        if unenc:  # 지난번에 녹화만 하고 인코딩 못 한 강의
-            self.encode_rows(unenc, "자동 녹화 중", later=self.cb_when.get() != self.ENC_WHEN[1])
+        if items:
+            hooks = {
+                "start_rec": lambda name: self._call(self._start_rec),
+                "stop_rec": lambda: self._call(self._stop_rec),
+                "is_busy": lambda: self.app.busy,
+                "skip": lambda i: self._call(self._skip, i),
+                "status": lambda i, text: self._ui(self._set, i, text),
+                "progress": lambda i, t, dur: self._ui(self._progress, i, t, dur),
+                "length": lambda i, sec: self._ui(self._set_len, i, sec),
+                "log": lambda text: self._ui(self.lbl.config, {"text": text}),
+                "finished": lambda msg: self._ui(self._finished, msg),
+            }
+            self.runner = lecture_auto.AutoRecorder(items, hooks, gap=self._gap())
+            self.lbl.config(text="작업 중... (Edge 강의 창과 마우스는 건드리지 마세요)")
+            self.runner.start()
+        else:
+            self.lbl.config(text="인코딩 중...")
+        self._persist()
+        self._pump()
+        self._update_total()
+
+    # -- 녹화 (AutoRecorder가 부름)
+    def _row(self, i):
+        return self.run_rows[i] if 0 <= i < len(self.run_rows) else None
+
+    def _skip(self, i):
+        """i번째 강의를 시작하기 직전: 그 사이 표에서 지웠거나 작업·상태를 바꿨으면 건너뜀"""
+        iid = self._row(i)
+        return not iid or not self.tree.exists(iid) or not self.needs_rec(iid)
+
+    def _start_rec(self):
+        """녹화 시작 (메인 스레드). 파일 이름은 지금 설정한 형식으로
+        이 강의를 전에 녹화하다 끊긴(또는 이상한) 파일이 있으면 휴지통으로 보내고 처음부터 다시 녹화"""
+        iid = self.cur_row
+        if not iid or not self.tree.exists(iid):
+            return False
+        old = self.rows[iid].get("raw")
+        if old and os.path.isfile(old) and to_recycle_bin(old):
+            self.lbl.config(text=f"전에 녹화하던 파일은 휴지통으로 보냈어요: {os.path.basename(old)}")
+        out_dir = self.app.var_dir.get()
+        os.makedirs(out_dir, exist_ok=True)
+        base = unique_base(out_dir, self._stem(iid), auto=True)
+        ok = self.app.start_recording(True, auto_base=base)
+        if ok:
+            # 갑자기 꺼져도 다음에 이 파일을 끊긴 파일로 알아보도록 바로 저장
+            self._upd(iid, raw=os.path.normpath(rec_paths(base, True)[2]))
+        return ok
 
     def _stop_rec(self):
         if self.app.recording:
             self.app.stop_recording()
 
-    def _row(self, i):
-        return self.run_rows[i] if 0 <= i < len(self.run_rows) else None
-
     def _set_len(self, i, sec):
         """실제 영상 길이 (예: 48분 15.7초)"""
+        self._upd(self._row(i), len=f"{int(sec // 60)}분 {sec % 60:.1f}초")
+
+    def _progress(self, i, t, dur):
         iid = self._row(i)
-        if iid and self.tree.exists(iid):
-            self.tree.set(iid, "len", f"{int(sec // 60)}분 {sec % 60:.1f}초")
-            self._persist()
+        if iid and dur:
+            self._upd(iid, "rec", persist=False, note="", pct=min(100.0, t / dur * 100), left=max(0.0, dur - t))
 
     def _set(self, i, text):
+        """AutoRecorder가 보낸 진행 문구 → 상태"""
         iid = self._row(i)
         self.cur_row = iid
-        if iid and self.tree.exists(iid):
-            self.tree.set(iid, "state", text)
-            if text == "완료":
-                self.completed.add(iid)
-                self._dispatch()
+        if not iid or not self.tree.exists(iid):
+            return
+        r = self.rows[iid]
+        if text == "완료":  # 끝까지 녹화함 → MP4 합치기가 끝나면 파일 확인
+            self.completed.add(iid)
+            self._upd(iid, "rec", note="파일 합치는 중", pct=None, left=None)
+            self._dispatch()
+        elif text.startswith("중지됨"):
+            self._upd(iid, "rec_stopped")
+        elif text.startswith("실패"):
+            self.counts["fail"] = self.counts.get("fail", 0) + 1
+            self._upd(iid, "rec_fail", note=text.split(":", 1)[-1].strip())
+        else:
+            note = "파일 합치는 중" if text == "저장 중" else text if text == "준비 중" else f"준비 중: {text}"
+            self._upd(iid, "rec", persist=r["st"] != "rec", note=note, pct=None, left=None)
             if text.startswith(("강의 여는", "녹화 시작")):
                 self.tree.see(iid)
-            if not text.startswith("녹화 중"):  # 진행 시간(0.5초마다)은 빼고 상태가 바뀔 때만 저장
-                self._persist()
 
-    def stop(self):
-        if self.runner and messagebox.askyesno(
-                "자동 녹화 중지", "자동 녹화를 멈출까요?\n"
-                                "지금 녹화 중인 강의는 다음에 시작하면 처음부터 다시 녹화해요."):
-            self.stopped = True
-            self.runner.stop()
-            self.btn_stop.config(state="disabled")
-            self.lbl.config(text="멈추는 중...")
+    def on_saved(self, path, ok=True):
+        """자동 녹화 강의 하나가 MP4로 합쳐짐 (끝까지 녹화했는지는 아직 모름). ok=False면 합치기 실패"""
+        key = os.path.normcase(os.path.normpath(path)) if path else None
+        if not ok:
+            for iid in list(self.completed):
+                if os.path.normcase(self.rows[iid].get("raw") or "") == key:
+                    self.completed.discard(iid)
+                    self.counts["fail"] = self.counts.get("fail", 0) + 1
+                    self._upd(iid, "rec_fail", note="파일 합치기 실패 (녹화 복구 탭에서 다시 합칠 수 있어요)")
+            return
+        self.muxed.add(key)
+        self._dispatch()
+
+    def _dispatch(self):
+        """끝까지 녹화를 마치고 합치기도 끝난 강의 → 파일 확인 → 정상이면 녹화 완료 (작업에 따라 인코딩 대기)
+        (중지·종료·오류로 중간에 끊긴 파일은 '녹화 완료'가 되지 않음)"""
+        for iid in list(self.completed):
+            p = self.rows[iid].get("raw") if iid in self.rows else None
+            key = os.path.normcase(os.path.normpath(p)) if p else None
+            if key not in self.muxed:
+                continue  # 아직 합치는 중
+            self.completed.discard(iid)
+            self.muxed.discard(key)
+            self._verify(iid, p, lambda iid=iid: self._recorded(iid),
+                         lambda problem, iid=iid: self._record_bad(iid, problem))
+
+    def _recorded(self, iid):
+        self.counts["rec"] = self.counts.get("rec", 0) + 1
+        self._upd(iid, "enc_wait" if has_enc(self.rows[iid]["task"]) else "rec_done")
+        self._pump()
+
+    def _record_bad(self, iid, problem):
+        self._upd(iid, "rec_wait", note=f"녹화 파일 이상: {problem}")
+        self._requeue(iid)
+        self.lbl.config(text=f"{self.rows[iid]['no']}강 파일이 이상해요 ({problem}) → 다시 녹화해요")
 
     def _finished(self, msg):
+        """AutoRecorder가 끝남 (녹화 끝) → '모든 녹화 후 인코딩'이면 이제 인코딩"""
         self.runner = None
-        for w in (self.btn_start, self.btn_add, self.btn_del, self.btn_clear, self.btn_edge):
-            w.config(state="normal")
-        self._enc_state()
+        self.cur_row = None
+        self.lbl.config(text=msg)
+        self._pump()
+        self._check_done()
+
+    # -- 인코딩
+    def _pump(self):
+        """인코딩할 차례가 된 강의(인코딩 대기)를 용량 줄이기로 보냄 (진행 방식에 따라)"""
+        if not self.session or self.stopped or self.flow() == "rec":
+            return
+        if self.flow() == "all" and self.runner is not None:
+            return  # 녹화가 모두 끝난 뒤에
+        items = []
+        for iid in self.tree.get_children():
+            r = self.rows[iid]
+            if iid in self.enc_sent or r["st"] != "enc_wait" or not has_enc(r["task"]):
+                continue
+            src = r.get("raw")
+            if not src or not os.path.isfile(src):
+                self._upd(iid, "missing", persist=False)
+                continue
+            self.enc_sent[iid] = os.path.normcase(os.path.normpath(src))
+            items.append((src, lambda iid=iid, src=src: self._enc_job(iid, src)))
+        if items:
+            self._persist()
+            self.app.encode.enqueue(items)
+
+    def _enc_job(self, iid, src):
+        """인코딩을 시작할 때 부름 → (설정, 끝나면 원본 제거, 만들 파일) - 작업 중에 바꾼 설정도 반영"""
+        d, name = os.path.split(src)
+        if name.endswith(RAW_TAG + ".mp4"):
+            out = os.path.join(d, name[:-len(RAW_TAG + ".mp4")] + ".mp4")
+        else:  # 예전 이름 ('제 1 강.mp4')
+            out = os.path.join(d, self._stem(iid) + ".mp4") if self.tree.exists(iid) else None
+        return self.enc_options(), bool(self.var_edel.get()), out
+
+    def _enc_row(self, src):
+        key = os.path.normcase(os.path.normpath(src))
+        return next((i for i, k in self.enc_sent.items() if k == key), None)
+
+    def encode_progress(self, src, pct, left):
+        """인코딩 진행률 → 표에 표시"""
+        iid = self._enc_row(src)
+        if iid:
+            first = self.rows[iid]["st"] != "enc"
+            self._upd(iid, "enc", persist=first, note="준비 중" if pct <= 0 else "",
+                      pct=pct if pct > 0 else None, left=left)
+
+    def _encoded(self, src, result, out=None, msg="", speed=None):
+        """인코딩이 끝남 (ok / fail / stopped / missing) → 표에 표시"""
+        iid = self._enc_row(src)
+        if not iid:
+            return
+        self.enc_sent.pop(iid, None)
+        if not self.tree.exists(iid):
+            return
+        if result == "ok":
+            self.counts["enc"] = self.counts.get("enc", 0) + 1
+            self._learn_speed(speed)
+            raw = src if os.path.isfile(src) else ""
+            self._upd(iid, "enc_done", raw=raw, enc=os.path.normpath(out) if out else "")
+            if out:  # 인코딩한 파일도 길이·용량 확인
+                self._verify(iid, out, lambda: None,
+                             lambda problem, iid=iid: self._upd(iid, "enc_fail", note=f"인코딩한 파일 이상 ({problem})"))
+        elif result == "stopped":
+            self._upd(iid, "enc_stopped")
+        elif result == "missing":
+            self._upd(iid, "missing")
+        else:
+            self.counts["fail"] = self.counts.get("fail", 0) + 1
+            self._upd(iid, "enc_fail", note=msg)
+        self._pump()
+        self._check_done()
+
+    # -- 중지 / 끝
+    def stop(self):
+        if not self.session:
+            return
+        if not messagebox.askyesno(
+                "작업 중지", "작업을 멈출까요?\n"
+                           "지금 녹화 중인 강의는 다음에 시작하면 처음부터 다시 녹화하고,\n"
+                           "인코딩 중인 파일은 만들던 파일을 지워요."):
+            return
+        self.stopped = True
+        if self.runner:
+            self.runner.stop()
+        dropped = self.app.encode.drop_auto()  # 아직 시작 안 한 인코딩은 '인코딩 대기'로 남김
+        for iid, key in list(self.enc_sent.items()):
+            if key in dropped:
+                self.enc_sent.pop(iid, None)
+        self.app.encode.stop()
         self.btn_stop.config(state="disabled")
-        if self.var_enc.get() and self.saved:
-            self._send_encode(self.saved)
-            msg += f"  ·  용량 줄이기 {len(self.saved)}개 시작 (진행 상황은 표의 '상태'에 표시)"
-            self.saved = []
+        self.lbl.config(text="멈추는 중...")
+        self._check_done()
+
+    def _check_done(self):
+        """녹화·합치기·파일 확인·인코딩이 모두 끝났으면 작업 끝"""
+        if not self.session or self.runner or self.app.busy or self.verifying or self.enc_sent or self.completed:
+            return
+        if not self.stopped:
+            self._pump()
+            if self.enc_sent:
+                return
+        self._end_session()
+
+    def _end_session(self):
+        self.session = False
+        self.run_rows = []
+        for w in (self.btn_start, self.btn_add, self.btn_del, self.btn_clear, self.btn_edge, self.btn_rename):
+            w.config(state="normal")
+        self.btn_stop.config(state="disabled")
+        c = self.counts
+        msg = f"작업 {'중지' if self.stopped else '끝'} - 녹화 완료 {c.get('rec', 0)}개, 인코딩 완료 {c.get('enc', 0)}개" \
+              + (f", 실패 {c['fail']}개" if c.get("fail") else "")
         self.lbl.config(text=msg)
         self._update_total()
         self._persist()
@@ -2660,8 +3235,8 @@ class AutoPanel(ttk.Frame):
             keep_awake(False)
 
     def _shutdown_when_idle(self):
-        """MP4 변환·용량 줄이기까지 모두 끝나면 1분 뒤 컴퓨터 종료 (그 사이 취소 가능)"""
-        if not self.var_shutdown.get() or self.running:
+        """MP4 변환·인코딩까지 모두 끝나면 1분 뒤 컴퓨터 종료 (그 사이 취소 가능)"""
+        if not self.var_shutdown.get() or self.session:
             return
         if self.app.busy or self.app.encode.busy or self.app.recording:
             self.after(3000, self._shutdown_when_idle)
@@ -2719,6 +3294,7 @@ class App:
         self.recording = False
         self.rec_start = 0.0
         self.rec_base = None
+        self.rec_paths = None      # 지금 녹화의 (영상 임시 파일, 소리 임시 파일, 합칠 MP4)
         self.busy = False
         self.close_pending = False  # MP4 변환 중 창을 닫으면 변환 후 종료
         self.last_audio_try = 0.0
@@ -2752,7 +3328,7 @@ class App:
             r = self.cap = ttk.Frame(self.nb)
             parent = self.nb
         self.recover = RecoverPanel(parent, get_dir=lambda: self.var_dir.get(),
-                                    get_active=lambda: self.rec_base if (self.recording or self.busy) else None,
+                                    get_active=lambda: self.rec_paths[0] if (self.rec_paths and (self.recording or self.busy)) else None,
                                     on_idle=self._maybe_close)
         self.trim = TrimPanel(parent, get_dir=lambda: self.var_dir.get())
         self.encode = EncodePanel(parent, get_dir=lambda: self.var_dir.get(), cfg=self.cfg,
@@ -2783,7 +3359,7 @@ class App:
             dev = ttk.Frame(snb, padding=(10, 8))
             snb.add(dev, text="  캡쳐 장치  ")
             save = ttk.Frame(snb, padding=(10, 8))
-            snb.add(save, text="  저장 · 용량 줄이기  ")
+            snb.add(save, text="  저장 · 파일 이름 · 인코딩  ")
             self._build_devices(dev)
             fo = ttk.Frame(save)
             fo.pack(fill="x")
@@ -3286,7 +3862,7 @@ class App:
         h, m, sec = wait // 3600, wait % 3600 // 60, wait % 60
         self.lbl_sched.config(text=f"예약됨: {s:%m/%d %H:%M:%S} ~ {end}  (시작까지 {h}시간 {m}분 {sec}초)")
 
-    def start_recording(self, quiet=False, name=None):
+    def start_recording(self, quiet=False, auto_base=None):
         if not self.video or self.video.get_frame() is None:
             if not quiet:
                 messagebox.showwarning("녹화 불가", "영상 신호가 아직 들어오지 않았어요.")
@@ -3295,14 +3871,15 @@ class App:
         os.makedirs(out_dir, exist_ok=True)
         self.cfg["out_dir"] = out_dir
         save_config(self.cfg)
-        if name:  # 자동 녹화: 강의 이름 그대로 (이미 있으면 '이름 (2)')
-            self.rec_base = unique_base(out_dir, name)
+        if auto_base:  # 자동 녹화: '제 1 강_제목(녹화중).mkv/.wav' → '제 1 강_제목(원본).mp4'
+            self.rec_base = auto_base
         else:  # 파일 이름 끝의 날짜_시각은 '녹화 복구' 탭에서 녹화 시각으로 씀
             self.rec_base = os.path.join(out_dir, "capture_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
+        self.rec_paths = rec_paths(self.rec_base, bool(auto_base))
         self.has_audio = bool(self.audio and self.audio.running)
         if self.has_audio:
-            self.audio.start_rec(self.rec_base + ".tmp.wav")
-        self.video.start_rec(self.rec_base + ".tmp.mkv")
+            self.audio.start_rec(self.rec_paths[1])
+        self.video.start_rec(self.rec_paths[0])
         self.rec_start = time.time()
         self.recording = True
         self.btn_rec.config(text="■ 녹화 중지")
@@ -3317,10 +3894,10 @@ class App:
         self.btn_rec.config(text="● 녹화 시작")
         self.busy = True
         self.lbl_status.config(text="MP4로 변환 중... 잠시만 기다려 주세요")
-        threading.Thread(target=self._mux, args=(self.rec_base, self.has_audio), daemon=True).start()
+        threading.Thread(target=self._mux, args=(self.rec_base, self.rec_paths, self.has_audio), daemon=True).start()
 
-    def _mux(self, base, has_audio, sync=False):
-        vid, wav, out = base + ".tmp.mkv", base + ".tmp.wav", base + ".mp4"
+    def _mux(self, base, paths, has_audio, sync=False):
+        vid, wav, out = paths
         self.video.wait_rec()
         ok, err, cmd = mux_to_mp4(vid, wav if has_audio else None, out)
         if ok:
@@ -3334,10 +3911,11 @@ class App:
         msg = (f"저장 완료: {out}" if ok
                else f"변환 실패 - '녹화 복구' 탭에서 다시 시도할 수 있어요 (원인: {os.path.basename(base)}.log)")
         if not sync:
-            self.root.after(0, self._mux_done, msg, out if ok else None)
+            self.root.after(0, self._mux_done, msg, out, ok)
         return ok
 
-    def _mux_done(self, msg, out=None):
+    def _mux_done(self, msg, path=None, ok=True):
+        out = path if ok else None
         self.busy = False
         self.lbl_status.config(text=msg)
         if not self.recording and not self.sched and not self.auto.running:
@@ -3345,8 +3923,8 @@ class App:
         if self.close_pending:  # 변환 중에 창을 닫았으면 이제 종료
             self._maybe_close()
             return
-        if out and self.auto.running:  # 자동 녹화 강의 저장됨 → (설정에 따라) 용량 줄이기
-            self.auto.on_saved(out)
+        if path and self.auto.running:  # 자동 녹화 강의 저장됨(또는 실패) → 확인 후 (작업에 따라) 인코딩
+            self.auto.on_saved(path, ok)
         if out and self.var_trim_after.get() and not self.recording and not self.auto.running \
                 and self.trim.load(out):
             if self.nb:
@@ -3428,7 +4006,7 @@ class App:
             return
         if self.recording and not messagebox.askyesno("종료", "녹화 중이에요. 녹화를 저장하고 종료할까요?"):
             return
-        if self.auto.running:
+        if self.auto.runner:
             if not self.recording and not messagebox.askyesno("종료", "자동 녹화 중이에요. 멈추고 종료할까요?"):
                 return
             self.auto.runner.stop()
@@ -3443,7 +4021,7 @@ class App:
                 self.audio.stop_rec()
             self.lbl_status.config(text="MP4로 변환 중...")
             self.root.update()
-            self._mux(self.rec_base, self.has_audio, sync=True)
+            self._mux(self.rec_base, self.rec_paths, self.has_audio, sync=True)
         if self.video:
             self.video.stop()
         if self.audio:
